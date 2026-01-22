@@ -2018,6 +2018,7 @@ class MainWindow(QMainWindow):
         # structured log storage for re-rendering in HEX/TEXT modes
         self._monitor_entries: List[dict] = []
         self._manual_entries: List[dict] = []
+        self._motor_mon_entries: List[dict] = []
 
         # ---- UI throttle timers (avoid stutter at high frame rates) ----
         self._monitor_dirty = False
@@ -2031,6 +2032,12 @@ class MainWindow(QMainWindow):
         self._manual_timer.setInterval(50)
         self._manual_timer.setSingleShot(True)
         self._manual_timer.timeout.connect(self._flush_manual_render)
+
+        self._motor_mon_dirty = False
+        self._motor_mon_timer = QTimer(self)
+        self._motor_mon_timer.setInterval(50)
+        self._motor_mon_timer.setSingleShot(True)
+        self._motor_mon_timer.timeout.connect(self._flush_motor_monitor_render)
 
         # ---- Plot throttle (refresh-rate driven) ----
         self._plot_dirty = False
@@ -2156,6 +2163,26 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.motor_dir_lamp)
         dir_row.addStretch(1)
         motor_layout.addLayout(dir_row)
+        # Mode selection
+        mode_row = QHBoxLayout()
+        self.motor_mode_tension_btn = QPushButton("张力模式")
+        self.motor_mode_speed_btn = QPushButton("速度模式")
+        self.motor_mode_tension_lamp = QLabel()
+        self.motor_mode_tension_lamp.setFixedSize(14, 14)
+        self._set_lamp_color(self.motor_mode_tension_lamp, "#777777")
+        self.motor_mode_speed_lamp = QLabel()
+        self.motor_mode_speed_lamp.setFixedSize(14, 14)
+        self._set_lamp_color(self.motor_mode_speed_lamp, "#777777")
+        mode_row.addWidget(self.motor_mode_tension_btn)
+        mode_row.addWidget(self.motor_mode_speed_btn)
+        mode_row.addWidget(QLabel("张力模式灯"))
+        mode_row.addWidget(self.motor_mode_tension_lamp)
+        mode_row.addWidget(QLabel("速度模式灯"))
+        mode_row.addWidget(self.motor_mode_speed_lamp)
+        mode_row.addStretch(1)
+        motor_layout.addLayout(mode_row)
+
+
 
         # Speed control
         speed_row = QHBoxLayout()
@@ -2201,12 +2228,50 @@ class MainWindow(QMainWindow):
             self.motor_estop_btn.setStyleSheet("background:#d9534f;color:white;font-weight:bold;")
         except Exception:
             pass
-        motor_layout.addWidget(self.motor_estop_btn)
-        motor_layout.addStretch(1)
+        try:
+            self.motor_estop_btn.setFixedSize(160, 120)
+        except Exception:
+            pass
+        estop_row = QHBoxLayout()
+        estop_row.addStretch(1)
+        estop_row.addWidget(self.motor_estop_btn)
+        estop_row.addStretch(1)
+        motor_layout.addLayout(estop_row)
+
+        # TX monitor for motor control
+        motor_mon_group = QGroupBox("发送串口监视")
+        motor_mon_layout = QVBoxLayout(motor_mon_group)
+        motor_mon_layout.setContentsMargins(6, 6, 6, 6)
+        motor_mon_mode_row = QHBoxLayout()
+        motor_mon_mode_row.addWidget(QLabel("显示方式"))
+        self.motor_mon_mode_combo = QComboBox()
+        self.motor_mon_mode_combo.addItem("文本(UTF-8)", "utf-8")
+        self.motor_mon_mode_combo.addItem("HEX", "hex")
+        self.motor_mon_mode_combo.addItem("文本(GBK)", "gbk")
+        self.motor_mon_mode_combo.setCurrentIndex(0)
+        self.motor_mon_mode_combo.currentIndexChanged.connect(lambda *_: self.schedule_motor_monitor_render(full=True))
+        motor_mon_mode_row.addWidget(self.motor_mon_mode_combo)
+        motor_mon_mode_row.addStretch(1)
+        self.motor_mon_clear_btn = QPushButton("清空")
+        self.motor_mon_clear_btn.clicked.connect(self.clear_motor_monitor)
+        motor_mon_mode_row.addWidget(self.motor_mon_clear_btn)
+        motor_mon_layout.addLayout(motor_mon_mode_row)
+        self.motor_mon_text = QPlainTextEdit()
+        self.motor_mon_text.setReadOnly(True)
+        self.motor_mon_text.setUndoRedoEnabled(False)
+        try:
+            self.motor_mon_text.setMaximumBlockCount(2000)
+        except Exception:
+            pass
+        self.motor_mon_text.setPlaceholderText("这里显示发送串口返回的数据。")
+        motor_mon_layout.addWidget(self.motor_mon_text, 1)
+        motor_layout.addWidget(motor_mon_group, 1)
+
 
         self.motor_dock.setWidget(motor_container)
         self.addDockWidget(Qt.RightDockWidgetArea, self.motor_dock)
         self.motor_dock.hide()  # default hidden
+        self.motor_dock.visibilityChanged.connect(lambda vis: vis and (self.schedule_motor_monitor_render(full=True) or True))
 
         self.motor_enable_btn.clicked.connect(lambda *_: self.on_motor_enable())
         self.motor_disable_btn.clicked.connect(lambda *_: self.on_motor_disable())
@@ -2216,6 +2281,9 @@ class MainWindow(QMainWindow):
         self.motor_tension_btn.clicked.connect(lambda *_: self.on_motor_tension())
         self.motor_pid_btn.clicked.connect(lambda *_: self.on_motor_pid())
         self.motor_estop_btn.clicked.connect(lambda *_: self.on_motor_estop())
+        self.motor_mode_tension_btn.clicked.connect(lambda *_: self.on_motor_mode_tension())
+        self.motor_mode_speed_btn.clicked.connect(lambda *_: self.on_motor_mode_speed())
+        self.motor_mode = None
 
         self.custom_send_btn.clicked.connect(lambda *_: self.send_custom_serial())
         self.custom_send_line.returnPressed.connect(self.send_custom_serial)
@@ -2697,6 +2765,16 @@ class MainWindow(QMainWindow):
         except Exception:
             self.render_custom_send_log(force_full=bool(full))
 
+
+    def schedule_motor_monitor_render(self, full: bool = False):
+        if full:
+            setattr(self, "_motor_mon_force_full", True)
+        self._motor_mon_dirty = True
+        try:
+            if not self._motor_mon_timer.isActive():
+                self._motor_mon_timer.start()
+        except Exception:
+            self.render_motor_monitor(force_full=bool(full))
     def _flush_monitor_render(self):
         if not getattr(self, "_monitor_dirty", False):
             return
@@ -2720,6 +2798,28 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+
+    def _flush_motor_monitor_render(self):
+        if not getattr(self, "_motor_mon_dirty", False):
+            return
+        if hasattr(self, "motor_dock") and not self.motor_dock.isVisible():
+            self._motor_mon_dirty = False
+            self._motor_mon_force_full = True
+            return
+
+        self._motor_mon_dirty = False
+        force_full = bool(getattr(self, "_motor_mon_force_full", False))
+        try:
+            self.render_motor_monitor(force_full=force_full)
+        finally:
+            self._motor_mon_force_full = False
+
+        if getattr(self, "_motor_mon_dirty", False):
+            try:
+                if not self._motor_mon_timer.isActive():
+                    self._motor_mon_timer.start()
+            except Exception:
+                pass
     def _flush_manual_render(self):
         if not getattr(self, "_manual_dirty", False):
             return
@@ -2950,6 +3050,13 @@ class MainWindow(QMainWindow):
         self._manual_render_mode = None
         self._manual_render_tag = None
 
+
+    def clear_motor_monitor(self):
+        self._motor_mon_entries.clear()
+        if hasattr(self, "motor_mon_text"):
+            self.motor_mon_text.clear()
+        self._motor_mon_render_idx = 0
+        self._motor_mon_render_mode = None
     def _decode_bytes(self, data: bytes, mode: str) -> str:
         if mode == "hex":
             return hex_bytes(data)
@@ -3059,6 +3166,41 @@ class MainWindow(QMainWindow):
         self._manual_render_tag = tag_filter
         self._manual_render_idx = len(self._manual_entries)
 
+
+    def render_motor_monitor(self, force_full: bool = False):
+        mode = "utf-8"
+        if hasattr(self, "motor_mon_mode_combo"):
+            mode = self.motor_mon_mode_combo.currentData() or "utf-8"
+        last_mode = getattr(self, "_motor_mon_render_mode", None)
+        render_idx = int(getattr(self, "_motor_mon_render_idx", 0) or 0)
+        max_lines = 2000
+
+        if force_full or last_mode != mode or render_idx > len(self._motor_mon_entries):
+            entries = self._motor_mon_entries[-max_lines:]
+            try:
+                self.motor_mon_text.blockSignals(True)
+                self.motor_mon_text.setPlainText("\n".join(self._format_entry(e, mode) for e in entries))
+                self.motor_mon_text.blockSignals(False)
+                self.motor_mon_text.moveCursor(QTextCursor.End)
+            except Exception:
+                pass
+            self._motor_mon_render_mode = mode
+            self._motor_mon_render_idx = len(self._motor_mon_entries)
+            return
+
+        if render_idx < len(self._motor_mon_entries):
+            new_entries = self._motor_mon_entries[render_idx:]
+            lines_out = [self._format_entry(e, mode) for e in new_entries]
+            if lines_out:
+                try:
+                    self.motor_mon_text.blockSignals(True)
+                    self.motor_mon_text.appendPlainText("\n".join(lines_out))
+                    self.motor_mon_text.blockSignals(False)
+                    self.motor_mon_text.moveCursor(QTextCursor.End)
+                except Exception:
+                    pass
+        self._motor_mon_render_mode = mode
+        self._motor_mon_render_idx = len(self._motor_mon_entries)
     @Slot(str, bytes, str, str)
     def on_frame(self, kind: str, data: bytes, tag: str, note: str):
         e = {"kind": str(kind), "data": bytes(data or b""), "tag": str(tag or ""), "note": str(note or "")}
@@ -3100,6 +3242,20 @@ class MainWindow(QMainWindow):
                     self._monitor_render_idx = 0
 
 
+
+        # Motor TX monitor: only RX frames from tx port
+        t2 = e.get("tag", "") or ""
+        k2 = str(kind)
+        if t2.startswith("tx:") and k2.startswith("RX"):
+            self._motor_mon_entries.append(e)
+            self.schedule_motor_monitor_render()
+            if len(self._motor_mon_entries) > 8000:
+                overflow = len(self._motor_mon_entries) - 8000
+                del self._motor_mon_entries[:overflow]
+                try:
+                    self._motor_mon_render_idx = max(0, int(getattr(self, "_motor_mon_render_idx", 0)) - overflow)
+                except Exception:
+                    self._motor_mon_render_idx = 0
     def save_monitor_log(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存通讯日志", "comm_log.txt", "Text Files (*.txt)")
         if not path:
@@ -3243,6 +3399,28 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+
+    def _set_motor_mode_lamps(self, mode: Optional[int]):
+        if mode == 0:
+            self._set_lamp_color(self.motor_mode_tension_lamp, "#5cb85c")
+            self._set_lamp_color(self.motor_mode_speed_lamp, "#777777")
+        elif mode == 1:
+            self._set_lamp_color(self.motor_mode_tension_lamp, "#777777")
+            self._set_lamp_color(self.motor_mode_speed_lamp, "#5cb85c")
+        else:
+            self._set_lamp_color(self.motor_mode_tension_lamp, "#777777")
+            self._set_lamp_color(self.motor_mode_speed_lamp, "#777777")
+
+    def _require_motor_mode(self, required: Optional[int] = None) -> bool:
+        if getattr(self, "motor_mode", None) is None:
+            QMessageBox.warning(self, "提示", "请先选择控制模式。")
+            return False
+        if required is not None and int(self.motor_mode) != int(required):
+            mode_name = "张力模式" if int(required) == 0 else "速度模式"
+            QMessageBox.warning(self, "提示", f"请先切换到{mode_name}。")
+            return False
+        return True
+
     def _motor_can_send(self) -> bool:
         if not self.is_connected or self.worker is None:
             QMessageBox.information(self, "提示", "请先连接串口后再操作电机控制。")
@@ -3276,6 +3454,16 @@ class MainWindow(QMainWindow):
             return None
         return f"{v:g}"
 
+    def on_motor_mode_tension(self):
+        if self._send_motor_cmd("ConMode 0"):
+            self.motor_mode = 0
+            self._set_motor_mode_lamps(self.motor_mode)
+
+    def on_motor_mode_speed(self):
+        if self._send_motor_cmd("ConMode 1"):
+            self.motor_mode = 1
+            self._set_motor_mode_lamps(self.motor_mode)
+
     def on_motor_enable(self):
         if self._send_motor_cmd("Enable"):
             self._set_lamp_color(self.motor_enable_lamp, "#5cb85c")
@@ -3293,12 +3481,16 @@ class MainWindow(QMainWindow):
             self._set_lamp_color(self.motor_dir_lamp, "#f0ad4e")
 
     def on_motor_speed(self):
+        if not self._require_motor_mode(1):
+            return
         val = self._parse_number_text(self.motor_speed_edit.text(), "转速(RPM)")
         if val is None:
             return
         self._send_motor_cmd(f"Con {val}")
 
     def on_motor_tension(self):
+        if not self._require_motor_mode(0):
+            return
         val = self._parse_number_text(self.motor_tension_edit.text(), "张力(g)")
         if val is None:
             return
@@ -3323,6 +3515,8 @@ class MainWindow(QMainWindow):
         self._send_motor_cmd("F 0")
         self._send_motor_cmd("Con 0")
         self._send_motor_cmd("Disable")
+        self.motor_mode = None
+        self._set_motor_mode_lamps(None)
         self._set_lamp_color(self.motor_enable_lamp, "#777777")
         self._set_lamp_color(self.motor_dir_lamp, "#777777")
 
