@@ -2117,6 +2117,106 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self.custom_send_dock)
         self.custom_send_dock.hide()  # default closed
 
+        # ---- Motor Control Dock (default hidden) ----
+        self.motor_dock = QDockWidget("电机控制", self)
+        try:
+            self.motor_dock.setObjectName('dock_motor')
+        except Exception:
+            pass
+        self.motor_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+
+        motor_container = QWidget()
+        motor_layout = QVBoxLayout(motor_container)
+        motor_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Enable/Disable
+        en_row = QHBoxLayout()
+        self.motor_enable_btn = QPushButton("使能")
+        self.motor_disable_btn = QPushButton("去使能")
+        self.motor_enable_lamp = QLabel()
+        self.motor_enable_lamp.setFixedSize(14, 14)
+        self._set_lamp_color(self.motor_enable_lamp, "#777777")
+        en_row.addWidget(self.motor_enable_btn)
+        en_row.addWidget(self.motor_disable_btn)
+        en_row.addWidget(QLabel("使能灯"))
+        en_row.addWidget(self.motor_enable_lamp)
+        en_row.addStretch(1)
+        motor_layout.addLayout(en_row)
+
+        # Direction
+        dir_row = QHBoxLayout()
+        self.motor_forward_btn = QPushButton("正转")
+        self.motor_backward_btn = QPushButton("反转")
+        self.motor_dir_lamp = QLabel()
+        self.motor_dir_lamp.setFixedSize(14, 14)
+        self._set_lamp_color(self.motor_dir_lamp, "#777777")
+        dir_row.addWidget(self.motor_forward_btn)
+        dir_row.addWidget(self.motor_backward_btn)
+        dir_row.addWidget(QLabel("转向灯"))
+        dir_row.addWidget(self.motor_dir_lamp)
+        dir_row.addStretch(1)
+        motor_layout.addLayout(dir_row)
+
+        # Speed control
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("转速(RPM)"))
+        self.motor_speed_edit = QLineEdit()
+        self.motor_speed_edit.setPlaceholderText("例如 100")
+        self.motor_speed_btn = QPushButton("转速控制")
+        speed_row.addWidget(self.motor_speed_edit, 1)
+        speed_row.addWidget(self.motor_speed_btn)
+        motor_layout.addLayout(speed_row)
+
+        # Tension control
+        tension_row = QHBoxLayout()
+        tension_row.addWidget(QLabel("张力(g)"))
+        self.motor_tension_edit = QLineEdit()
+        self.motor_tension_edit.setPlaceholderText("例如 1")
+        self.motor_tension_btn = QPushButton("张力控制")
+        tension_row.addWidget(self.motor_tension_edit, 1)
+        tension_row.addWidget(self.motor_tension_btn)
+        motor_layout.addLayout(tension_row)
+
+        # PID control
+        pid_row = QHBoxLayout()
+        pid_row.addWidget(QLabel("Kp"))
+        self.motor_kp_edit = QLineEdit()
+        self.motor_kp_edit.setPlaceholderText("Kp:例如0.1")
+        pid_row.addWidget(self.motor_kp_edit)
+        pid_row.addWidget(QLabel("Ki"))
+        self.motor_ki_edit = QLineEdit()
+        self.motor_ki_edit.setPlaceholderText("Ki:例如0.02")
+        pid_row.addWidget(self.motor_ki_edit)
+        pid_row.addWidget(QLabel("Kd"))
+        self.motor_kd_edit = QLineEdit()
+        self.motor_kd_edit.setPlaceholderText("Kd:例如0.005")
+        pid_row.addWidget(self.motor_kd_edit)
+        self.motor_pid_btn = QPushButton("PID设置")
+        pid_row.addWidget(self.motor_pid_btn)
+        motor_layout.addLayout(pid_row)
+
+        # Emergency stop
+        self.motor_estop_btn = QPushButton("急停")
+        try:
+            self.motor_estop_btn.setStyleSheet("background:#d9534f;color:white;font-weight:bold;")
+        except Exception:
+            pass
+        motor_layout.addWidget(self.motor_estop_btn)
+        motor_layout.addStretch(1)
+
+        self.motor_dock.setWidget(motor_container)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.motor_dock)
+        self.motor_dock.hide()  # default hidden
+
+        self.motor_enable_btn.clicked.connect(self.on_motor_enable)
+        self.motor_disable_btn.clicked.connect(self.on_motor_disable)
+        self.motor_forward_btn.clicked.connect(self.on_motor_forward)
+        self.motor_backward_btn.clicked.connect(self.on_motor_backward)
+        self.motor_speed_btn.clicked.connect(self.on_motor_speed)
+        self.motor_tension_btn.clicked.connect(self.on_motor_tension)
+        self.motor_pid_btn.clicked.connect(self.on_motor_pid)
+        self.motor_estop_btn.clicked.connect(self.on_motor_estop)
+
         self.custom_send_btn.clicked.connect(self.send_custom_serial)
         self.custom_send_line.returnPressed.connect(self.send_custom_serial)
         self.custom_send_dock.visibilityChanged.connect(lambda vis: vis and (self.update_custom_send_ports() or True) and (self.schedule_custom_send_render(full=True) or True))
@@ -2154,6 +2254,11 @@ class MainWindow(QMainWindow):
         self.mon_rx_chk.toggled.connect(self.schedule_monitor_render)
         self.mon_tx_chk.toggled.connect(self.on_tx_monitor_toggled)
 
+        # ---- Control menu ----
+        ctrl_menu = self.menuBar().addMenu("控制")
+        act_motor = ctrl_menu.addAction("电机控制")
+        act_motor.triggered.connect(self.open_motor_control)
+
 
         # ---- Serial simulator menu ----
         sim_menu = self.menuBar().addMenu('串口仿真')
@@ -2185,6 +2290,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+
+    def open_motor_control(self):
+        if not hasattr(self, 'motor_dock') or self.motor_dock is None:
+            return
+        self.motor_dock.show()
+        try:
+            self.motor_dock.raise_()
+            self.motor_dock.activateWindow()
+        except Exception:
+            pass
 
     def _apply_stable_widget_sizing(self):
         """Prevent left-panel width jitter caused by long/short combo texts.
@@ -2962,6 +3077,98 @@ class MainWindow(QMainWindow):
         self.worker.enqueue_custom_send(str(target), text, add_crlf)
         # don't clear input (方便连续修改/重复发送)
         self.custom_send_line.setFocus()
+
+    # ---------- motor control ----------
+    def _set_lamp_color(self, label: QLabel, color: str):
+        if label is None:
+            return
+        try:
+            label.setStyleSheet(f"background:{color};border-radius:7px;border:1px solid #444;")
+        except Exception:
+            pass
+
+    def _motor_can_send(self) -> bool:
+        if not self.is_connected or self.worker is None:
+            QMessageBox.information(self, "提示", "请先连接串口后再操作电机控制。")
+            return False
+        if not getattr(self.worker, "tx_enabled", False) or getattr(self.worker, "_tx_ser", None) is None:
+            QMessageBox.information(self, "提示", "请先启用“发送串口(输出)”并连接。")
+            return False
+        return True
+
+    def _send_motor_cmd(self, cmd: str) -> bool:
+        if not self._motor_can_send():
+            return False
+        text = (cmd or "").strip()
+        if not text:
+            return False
+        self.worker.enqueue_custom_send("tx", text, True)
+        return True
+
+    def _parse_number_text(self, text: str, label: str) -> Optional[str]:
+        t = (text or "").strip()
+        if not t:
+            QMessageBox.warning(self, "提示", f"请输入{label}。")
+            return None
+        try:
+            v = float(t)
+        except Exception:
+            QMessageBox.warning(self, "提示", f"{label}不是有效数字。")
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            QMessageBox.warning(self, "提示", f"{label}不是有效数字。")
+            return None
+        return f"{v:g}"
+
+    def on_motor_enable(self):
+        if self._send_motor_cmd("Enable"):
+            self._set_lamp_color(self.motor_enable_lamp, "#5cb85c")
+
+    def on_motor_disable(self):
+        if self._send_motor_cmd("Disable"):
+            self._set_lamp_color(self.motor_enable_lamp, "#777777")
+
+    def on_motor_forward(self):
+        if self._send_motor_cmd("Forward"):
+            self._set_lamp_color(self.motor_dir_lamp, "#5cb85c")
+
+    def on_motor_backward(self):
+        if self._send_motor_cmd("Backward"):
+            self._set_lamp_color(self.motor_dir_lamp, "#f0ad4e")
+
+    def on_motor_speed(self):
+        val = self._parse_number_text(self.motor_speed_edit.text(), "转速(RPM)")
+        if val is None:
+            return
+        self._send_motor_cmd(f"Con {val}")
+
+    def on_motor_tension(self):
+        val = self._parse_number_text(self.motor_tension_edit.text(), "张力(g)")
+        if val is None:
+            return
+        self._send_motor_cmd(f"F {val}")
+
+    def on_motor_pid(self):
+        kp = self._parse_number_text(self.motor_kp_edit.text(), "Kp")
+        if kp is None:
+            return
+        ki = self._parse_number_text(self.motor_ki_edit.text(), "Ki")
+        if ki is None:
+            return
+        kd = self._parse_number_text(self.motor_kd_edit.text(), "Kd")
+        if kd is None:
+            return
+        self._send_motor_cmd(f"pid {kp} {ki} {kd}")
+
+    def on_motor_estop(self):
+        if not self._motor_can_send():
+            return
+        # Order: tension -> speed -> disable
+        self._send_motor_cmd("F 0")
+        self._send_motor_cmd("Con 0")
+        self._send_motor_cmd("Disable")
+        self._set_lamp_color(self.motor_enable_lamp, "#777777")
+        self._set_lamp_color(self.motor_dir_lamp, "#777777")
 
     def _set_serial_widgets_enabled(self, enabled: bool):
         for w in [
