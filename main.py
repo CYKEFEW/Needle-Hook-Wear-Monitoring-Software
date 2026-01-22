@@ -20,6 +20,7 @@ Modbus RTU 串口上位机助手（浅色主题 / 多通道绘图 / XLSX 导出 
 
 import sys
 import time
+import math
 import struct
 import threading
 import queue
@@ -1684,7 +1685,12 @@ class MainWindow(QMainWindow):
         self._val_buf_by_channel: Dict[str, object] = {}  # name -> np.ndarray or list
         self._plot_x = None  # contiguous x for plotting (numpy)
         self._plot_y_by_channel: Dict[str, object] = {}  # name -> np.ndarray or list
+        self._fric_buf = None
+        self._mu_buf = None
+        self._fric_plot_y = None
+        self._mu_plot_y = None
         self._plot_seq = 0
+
         self._last_plotted_seq = -1
         # Smooth scrolling time base (relative seconds).
         self._t0_mono_ts = None           # time.monotonic() at first sample
@@ -1695,6 +1701,10 @@ class MainWindow(QMainWindow):
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
         self._settings = QSettings("ModbusAssistant", "ModbusAssistant")
+        self._fric_high_name = ""
+        self._fric_low_name = ""
+        self._wrap_angle_deg = 0.0
+        self._wrap_angle_rad = 0.0
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -1709,17 +1719,11 @@ class MainWindow(QMainWindow):
         left = QVBoxLayout(left_widget)
         left.setContentsMargins(8, 8, 8, 8)
 
-        right_widget = QWidget()
-        right = QVBoxLayout(right_widget)
-        right.setContentsMargins(8, 8, 8, 8)
 
         self.main_splitter.addWidget(left_widget)
-        self.main_splitter.addWidget(right_widget)
-        self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(0, 1)
         try:
             self.main_splitter.setCollapsible(0, False)
-            self.main_splitter.setCollapsible(1, False)
         except Exception:
             pass
 
@@ -1919,6 +1923,7 @@ class MainWindow(QMainWindow):
         self.ch_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.ch_table.horizontalHeader().setStretchLastSection(True)
         self.ch_table.setAlternatingRowColors(True)
+        self.ch_table.itemChanged.connect(lambda *_: self._refresh_friction_channel_options())
         cl.addWidget(self.ch_table)
 
         btn_row = QHBoxLayout()
@@ -1947,11 +1952,11 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                # Different pyqtgraph versions use 'mode' or 'method'
-                pi.setDownsampling(auto=True, mode='peak')
+                # Different pyqtgraph versions use "mode" or "method"
+                pi.setDownsampling(auto=True, mode="peak")
             except Exception:
                 try:
-                    pi.setDownsampling(auto=True, method='peak')
+                    pi.setDownsampling(auto=True, method="peak")
                 except Exception:
                     pass
         except Exception:
@@ -1960,13 +1965,112 @@ class MainWindow(QMainWindow):
         self._max_display_points = 6000
 
         self.plot.setLabel("bottom", "时间", units="s")
-        self.plot.setLabel("left", "数值")
+        self.plot.setLabel("left", "张力")
         self.plot.addLegend()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
-        right.addWidget(self.plot, 1)
 
+        # ---- Friction force plot ----
+        self.friction_plot = pg.PlotWidget()
+        try:
+            pi = self.friction_plot.getPlotItem()
+            try:
+                pi.setClipToView(True)
+            except Exception:
+                pass
+            try:
+                pi.setDownsampling(auto=True, mode="peak")
+            except Exception:
+                try:
+                    pi.setDownsampling(auto=True, method="peak")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.friction_plot.setLabel("bottom", "时间", units="s")
+        self.friction_plot.setLabel("left", "摩擦力")
+        self.friction_plot.addLegend()
+        self.friction_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.friction_curve = self.friction_plot.plot([], [], name="摩擦力", pen=pg.mkPen(color=(255, 140, 0), width=2))
+
+        # ---- Friction coefficient plot ----
+        self.mu_plot = pg.PlotWidget()
+        try:
+            pi = self.mu_plot.getPlotItem()
+            try:
+                pi.setClipToView(True)
+            except Exception:
+                pass
+            try:
+                pi.setDownsampling(auto=True, mode="peak")
+            except Exception:
+                try:
+                    pi.setDownsampling(auto=True, method="peak")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.mu_plot.setLabel("bottom", "时间", units="s")
+        self.mu_plot.setLabel("left", "摩擦系数")
+        self.mu_plot.addLegend()
+        self.mu_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.mu_curve = self.mu_plot.plot([], [], name="摩擦系数", pen=pg.mkPen(color=(0, 120, 220), width=2))
+
+        # ---- Plot window (dock) ----
+        self.plot_tabs = QTabWidget()
+        tension_tab = QWidget()
+        t_layout = QVBoxLayout(tension_tab)
+        t_layout.setContentsMargins(0, 0, 0, 0)
+        t_layout.addWidget(self.plot, 1)
         self.status_label = QLabel("状态：未连接")
-        right.addWidget(self.status_label)
+        t_layout.addWidget(self.status_label)
+        self.plot_tabs.addTab(tension_tab, "张力")
+
+        self.friction_tab = QWidget()
+        f_layout = QVBoxLayout(self.friction_tab)
+        f_layout.setContentsMargins(0, 0, 0, 0)
+        cfg = QGridLayout()
+        self.fric_high_combo = QComboBox()
+        self.fric_low_combo = QComboBox()
+        self.fric_swap_btn = QPushButton("互换")
+        self.wrap_angle_spin = QDoubleSpinBox()
+        self.wrap_angle_spin.setDecimals(2)
+        self.wrap_angle_spin.setRange(0.0, 360.0)
+        self.wrap_angle_spin.setSingleStep(1.0)
+        self.wrap_angle_spin.setValue(0.0)
+        self.wrap_angle_spin.setSuffix(" °")
+        cfg.addWidget(QLabel("高张力侧"), 0, 0)
+        cfg.addWidget(self.fric_high_combo, 0, 1)
+        cfg.addWidget(QLabel("低张力侧"), 0, 2)
+        cfg.addWidget(self.fric_low_combo, 0, 3)
+        cfg.addWidget(self.fric_swap_btn, 0, 4)
+        cfg.addWidget(QLabel("包角"), 1, 0)
+        cfg.addWidget(self.wrap_angle_spin, 1, 1)
+        cfg.setColumnStretch(5, 1)
+        f_layout.addLayout(cfg)
+        f_layout.addWidget(self.friction_plot, 1)
+
+        self.mu_tab = QWidget()
+        mu_layout = QVBoxLayout(self.mu_tab)
+        mu_layout.setContentsMargins(0, 0, 0, 0)
+        mu_layout.addWidget(self.mu_plot, 1)
+
+        self.plot_dock = QDockWidget("绘图窗口", self)
+        try:
+            self.plot_dock.setObjectName("dock_plot")
+        except Exception:
+            pass
+        self.plot_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea | Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(6, 6, 6, 6)
+        plot_layout.addWidget(self.plot_tabs, 1)
+        self.plot_dock.setWidget(plot_container)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.plot_dock)
+
+        self.fric_high_combo.currentIndexChanged.connect(self._on_friction_config_changed)
+        self.fric_low_combo.currentIndexChanged.connect(self._on_friction_config_changed)
+        self.wrap_angle_spin.valueChanged.connect(self._on_friction_config_changed)
+        self.fric_swap_btn.clicked.connect(self._swap_friction_channels)
 
         # ---- Comm Monitor Dock ----
         self.monitor_dock = QDockWidget("通讯监视窗口", self)
@@ -2328,6 +2432,24 @@ class MainWindow(QMainWindow):
         act_motor.triggered.connect(self.open_motor_control)
 
 
+        # ---- Plot window menu ----
+        plot_menu = self.menuBar().addMenu("绘图窗口")
+        self.act_plot_window = plot_menu.addAction("显示绘图窗口")
+        self.act_plot_window.setCheckable(True)
+        self.act_plot_window.setChecked(True)
+        self.act_plot_window.toggled.connect(lambda on: self.plot_dock.setVisible(on))
+        self.plot_dock.visibilityChanged.connect(lambda vis: self.act_plot_window.setChecked(vis))
+
+        self.act_friction_plot = plot_menu.addAction("摩擦力绘图窗口")
+        self.act_friction_plot.setCheckable(True)
+        self.act_friction_plot.setChecked(False)
+        self.act_friction_plot.toggled.connect(lambda on: self._set_plot_tab_visible(self.friction_tab, "摩擦力", on))
+
+        self.act_mu_plot = plot_menu.addAction("摩擦系数绘图窗口")
+        self.act_mu_plot.setCheckable(True)
+        self.act_mu_plot.setChecked(False)
+        self.act_mu_plot.toggled.connect(lambda on: self._set_plot_tab_visible(self.mu_tab, "摩擦系数", on))
+
         # ---- Serial simulator menu ----
         sim_menu = self.menuBar().addMenu('串口仿真')
         act_sim = sim_menu.addAction('打开仿真串口界面')
@@ -2342,6 +2464,7 @@ class MainWindow(QMainWindow):
         # 默认两通道：两个 int16（01 03 00 00 00 02 ...）
         self.add_channel_row(default_name="CH1", default_addr=0, default_dtype="int16")
         self.add_channel_row(default_name="CH2", default_addr=1, default_dtype="int16")
+        self._refresh_friction_channel_options()
 
         # Keep layout stable (no left-panel width jitter) and restore last workspace state.
         self._apply_stable_widget_sizing()
@@ -2434,6 +2557,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.plot.update()
+
                 try:
                     self.plot.repaint()
                 except Exception:
@@ -2735,7 +2859,13 @@ class MainWindow(QMainWindow):
         if not had_split:
             try:
                 if hasattr(self, 'main_splitter'):
-                    self.main_splitter.setSizes([420, 1000])
+                    try:
+                        if int(self.main_splitter.count()) >= 2:
+                            self.main_splitter.setSizes([420, 1000])
+                        else:
+                            self.main_splitter.setSizes([1000])
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -2845,6 +2975,281 @@ class MainWindow(QMainWindow):
     def _mark_plot_dirty(self, *args, **kwargs):
         self._plot_dirty = True
 
+    def _set_plot_tab_visible(self, tab_widget: QWidget, title: str, visible: bool):
+        if not hasattr(self, "plot_tabs"):
+            return
+        idx = self.plot_tabs.indexOf(tab_widget)
+        if visible and idx < 0:
+            self.plot_tabs.addTab(tab_widget, title)
+            try:
+                self.plot_tabs.setCurrentWidget(tab_widget)
+            except Exception:
+                pass
+            try:
+                self.plot_dock.show()
+                self.plot_dock.raise_()
+                self.plot_dock.activateWindow()
+            except Exception:
+                pass
+        elif (not visible) and idx >= 0:
+            try:
+                self.plot_tabs.removeTab(idx)
+            except Exception:
+                pass
+
+    def _refresh_friction_channel_options(self):
+        if not hasattr(self, "fric_high_combo") or not hasattr(self, "fric_low_combo"):
+            return
+        names = []
+        try:
+            rows = int(self.ch_table.rowCount()) if hasattr(self, "ch_table") else 0
+        except Exception:
+            rows = 0
+        for r in range(rows):
+            name = None
+            try:
+                item = self.ch_table.item(r, 1) if hasattr(self, "ch_table") else None
+                name = (item.text() if item else "").strip()
+            except Exception:
+                name = ""
+            if not name:
+                name = f"CH{r+1}"
+            if name and name not in names:
+                names.append(name)
+
+        cur_high = self.fric_high_combo.currentText() if hasattr(self, "fric_high_combo") else ""
+        cur_low = self.fric_low_combo.currentText() if hasattr(self, "fric_low_combo") else ""
+
+        for combo in [self.fric_high_combo, self.fric_low_combo]:
+            try:
+                combo.blockSignals(True)
+                combo.clear()
+                if not names:
+                    combo.addItem("(无通道)")
+                    combo.setEnabled(False)
+                else:
+                    for n in names:
+                        combo.addItem(n)
+                    combo.setEnabled(True)
+            except Exception:
+                pass
+            finally:
+                try:
+                    combo.blockSignals(False)
+                except Exception:
+                    pass
+
+        # Restore selection if possible
+        try:
+            if cur_high and cur_high in names:
+                self.fric_high_combo.setCurrentText(cur_high)
+            if cur_low and cur_low in names:
+                self.fric_low_combo.setCurrentText(cur_low)
+        except Exception:
+            pass
+
+        self._on_friction_config_changed()
+
+    def _swap_friction_channels(self):
+        try:
+            if not self.fric_high_combo.isEnabled() or not self.fric_low_combo.isEnabled():
+                return
+            hi = self.fric_high_combo.currentIndex()
+            lo = self.fric_low_combo.currentIndex()
+            if hi < 0 or lo < 0:
+                return
+            self.fric_high_combo.setCurrentIndex(lo)
+            self.fric_low_combo.setCurrentIndex(hi)
+        except Exception:
+            pass
+        self._on_friction_config_changed()
+
+    def _on_friction_config_changed(self, *args):
+        try:
+            self._fric_high_name = (self.fric_high_combo.currentText() or "").strip()
+            self._fric_low_name = (self.fric_low_combo.currentText() or "").strip()
+        except Exception:
+            self._fric_high_name = ""
+            self._fric_low_name = ""
+        try:
+            self._wrap_angle_deg = float(self.wrap_angle_spin.value()) if hasattr(self, "wrap_angle_spin") else 0.0
+        except Exception:
+            self._wrap_angle_deg = 0.0
+        try:
+            self._wrap_angle_rad = math.radians(float(self._wrap_angle_deg)) if float(self._wrap_angle_deg) > 0 else 0.0
+        except Exception:
+            self._wrap_angle_rad = 0.0
+
+        self._recalc_friction_buffers()
+        try:
+            self._plot_seq = int(getattr(self, "_plot_seq", 0) or 0) + 1
+        except Exception:
+            pass
+        self._plot_dirty = True
+        try:
+            self.update_plot()
+        except Exception:
+            pass
+
+    def _calc_fric_mu(self, high_v, low_v):
+        try:
+            if high_v is None or low_v is None:
+                return None, None
+            high = float(high_v)
+            low = float(low_v)
+        except Exception:
+            return None, None
+        try:
+            if not math.isfinite(high) or not math.isfinite(low):
+                return None, None
+        except Exception:
+            pass
+        fric = high - low
+        mu = None
+        theta = float(getattr(self, "_wrap_angle_rad", 0.0) or 0.0)
+        if theta > 0 and low > 0 and high > 0:
+            try:
+                ratio = high / low
+                if ratio > 0:
+                    mu = math.log(ratio) / theta
+            except Exception:
+                mu = None
+        return fric, mu
+
+    def _update_friction_buffers_at_index(self, idx: int, row: dict):
+        if self._fric_buf is None or self._mu_buf is None:
+            return
+        high_name = (getattr(self, "_fric_high_name", "") or "").strip()
+        low_name = (getattr(self, "_fric_low_name", "") or "").strip()
+        if (not high_name) or (not low_name):
+            fric, mu = None, None
+        else:
+            fric, mu = self._calc_fric_mu(row.get(high_name), row.get(low_name))
+        if np is not None:
+            try:
+                self._fric_buf[idx] = (np.nan if fric is None else float(fric))
+                self._mu_buf[idx] = (np.nan if mu is None else float(mu))
+            except Exception:
+                pass
+        else:
+            self._fric_buf[idx] = fric
+            self._mu_buf[idx] = mu
+
+    def _recalc_friction_buffers(self):
+        size = int(getattr(self, "_buf_size", 0) or 0)
+        if size <= 0 or self._fric_buf is None or self._mu_buf is None:
+            return
+        high_name = (getattr(self, "_fric_high_name", "") or "").strip()
+        low_name = (getattr(self, "_fric_low_name", "") or "").strip()
+        high_buf = self._val_buf_by_channel.get(high_name) if high_name else None
+        low_buf = self._val_buf_by_channel.get(low_name) if low_name else None
+        for i in range(size):
+            if high_buf is None or low_buf is None:
+                fric, mu = None, None
+            else:
+                try:
+                    hv = high_buf[i]
+                    lv = low_buf[i]
+                except Exception:
+                    hv = None
+                    lv = None
+                fric, mu = self._calc_fric_mu(hv, lv)
+            if np is not None:
+                try:
+                    self._fric_buf[i] = (np.nan if fric is None else float(fric))
+                    self._mu_buf[i] = (np.nan if mu is None else float(mu))
+                except Exception:
+                    pass
+            else:
+                self._fric_buf[i] = fric
+                self._mu_buf[i] = mu
+
+    def _update_friction_plots(self, xs, idx: int, full: bool, count: int, scroll_live: bool, x_left: float, x_right: float):
+        if xs is None or self._fric_buf is None or self._mu_buf is None:
+            return
+        size = int(getattr(self, "_buf_size", 0) or 0)
+        if size <= 0:
+            return
+
+        # X range sync
+        if scroll_live:
+            try:
+                self.friction_plot.setXRange(x_left, x_right, padding=0.0)
+            except Exception:
+                pass
+            try:
+                self.mu_plot.setXRange(x_left, x_right, padding=0.0)
+            except Exception:
+                pass
+
+        if np is not None:
+            if full:
+                first = size - idx
+                if self._fric_plot_y is None or getattr(self._fric_plot_y, "shape", (0,))[0] != size:
+                    self._fric_plot_y = np.empty(size, dtype=float)
+                if self._mu_plot_y is None or getattr(self._mu_plot_y, "shape", (0,))[0] != size:
+                    self._mu_plot_y = np.empty(size, dtype=float)
+                self._fric_plot_y[:first] = self._fric_buf[idx:]
+                self._fric_plot_y[first:] = self._fric_buf[:idx]
+                self._mu_plot_y[:first] = self._mu_buf[idx:]
+                self._mu_plot_y[first:] = self._mu_buf[:idx]
+                ys_fric = self._fric_plot_y
+                ys_mu = self._mu_plot_y
+            else:
+                ys_fric = self._fric_buf[:count]
+                ys_mu = self._mu_buf[:count]
+            try:
+                self.friction_curve.setData(xs, ys_fric, connect="finite", skipFiniteCheck=True)
+            except Exception:
+                try:
+                    self.friction_curve.setData(xs, ys_fric, connect="finite")
+                except Exception:
+                    pass
+            try:
+                self.mu_curve.setData(xs, ys_mu, connect="finite", skipFiniteCheck=True)
+            except Exception:
+                try:
+                    self.mu_curve.setData(xs, ys_mu, connect="finite")
+                except Exception:
+                    pass
+        else:
+            if full:
+                fric_raw = list(self._fric_buf[idx:]) + list(self._fric_buf[:idx])
+                mu_raw = list(self._mu_buf[idx:]) + list(self._mu_buf[:idx])
+            else:
+                fric_raw = list(self._fric_buf[:count])
+                mu_raw = list(self._mu_buf[:count])
+            xs_f, ys_f = [], []
+            xs_m, ys_m = [], []
+            for t, v in zip(xs, fric_raw):
+                if v is None:
+                    continue
+                xs_f.append(t)
+                ys_f.append(v)
+            for t, v in zip(xs, mu_raw):
+                if v is None:
+                    continue
+                xs_m.append(t)
+                ys_m.append(v)
+            try:
+                self.friction_curve.setData(xs_f, ys_f)
+            except Exception:
+                pass
+            try:
+                self.mu_curve.setData(xs_m, ys_m)
+            except Exception:
+                pass
+
+        # Autoscale handling for derived plots
+        try:
+            auto = bool(self.autoscale_chk.isChecked()) if hasattr(self, "autoscale_chk") else True
+        except Exception:
+            auto = True
+        try:
+            self.friction_plot.enableAutoRange(axis="y", enable=auto)
+            self.mu_plot.enableAutoRange(axis="y", enable=auto)
+        except Exception:
+            pass
     def _flush_plot(self):
         # Plot refresh is driven by timer (Hz). We always call update_plot(),
         # which will only re-upload curve data when new samples arrive, but
@@ -2928,6 +3333,17 @@ class MainWindow(QMainWindow):
             self._ts_buf = [None] * size
             self._plot_x = None
 
+        if np is not None:
+            self._fric_buf = np.full(size, np.nan, dtype=float)
+            self._mu_buf = np.full(size, np.nan, dtype=float)
+            self._fric_plot_y = np.empty(size, dtype=float)
+            self._mu_plot_y = np.empty(size, dtype=float)
+        else:
+            self._fric_buf = [None] * size
+            self._mu_buf = [None] * size
+            self._fric_plot_y = None
+            self._mu_plot_y = None
+
         self._val_buf_by_channel = {}
         self._plot_y_by_channel = {}
         for name in channel_names:
@@ -2958,6 +3374,35 @@ class MainWindow(QMainWindow):
                     else:
                         self._val_buf_by_channel[name][:k] = list(tail_y)
 
+                # recompute friction buffers for preserved samples
+                high_name = (getattr(self, "_fric_high_name", "") or "").strip()
+                low_name = (getattr(self, "_fric_low_name", "") or "").strip()
+                if high_name and low_name:
+                    tail_high = (ys_map or {}).get(high_name, [])
+                    tail_low = (ys_map or {}).get(low_name, [])
+                    tail_high = tail_high[-k:] if tail_high else [None] * k
+                    tail_low = tail_low[-k:] if tail_low else [None] * k
+                    for j in range(k):
+                        fric, mu = self._calc_fric_mu(tail_high[j], tail_low[j])
+                        if np is not None:
+                            try:
+                                self._fric_buf[j] = (np.nan if fric is None else float(fric))
+                                self._mu_buf[j] = (np.nan if mu is None else float(mu))
+                            except Exception:
+                                pass
+                        else:
+                            self._fric_buf[j] = fric
+                            self._mu_buf[j] = mu
+                else:
+                    if np is not None:
+                        try:
+                            self._fric_buf[:k] = np.nan
+                            self._mu_buf[:k] = np.nan
+                        except Exception:
+                            pass
+                    else:
+                        self._fric_buf[:k] = [None] * k
+                        self._mu_buf[:k] = [None] * k
                 self._buf_count = k
                 self._buf_idx = k % size
 
@@ -3559,11 +4004,13 @@ class MainWindow(QMainWindow):
 
         self.ch_table.setItem(row, 6, QTableWidgetItem("-0.01"))
 
+        self._refresh_friction_channel_options()
     def delete_selected_rows(self):
         rows = sorted({idx.row() for idx in self.ch_table.selectedIndexes()}, reverse=True)
         for r in rows:
             self.ch_table.removeRow(r)
 
+        self._refresh_friction_channel_options()
     def gather_channels(self) -> List[ChannelConfig]:
         channels: List[ChannelConfig] = []
         seen_names = set()
@@ -3626,6 +4073,13 @@ class MainWindow(QMainWindow):
         self.plot.clear()
         self.plot.addLegend()
         self.curves.clear()
+        try:
+            if hasattr(self, "friction_curve") and self.friction_curve is not None:
+                self.friction_curve.setData([], [])
+            if hasattr(self, "mu_curve") and self.mu_curve is not None:
+                self.mu_curve.setData([], [])
+        except Exception:
+            pass
         self.set_status("已清空数据")
 
     def init_curves(self, channel_names: List[str]):
@@ -3724,6 +4178,9 @@ class MainWindow(QMainWindow):
             for name in self.channel_names:
                 self._val_buf_by_channel[name][i] = row.get(name, None)
 
+        # update derived friction buffers
+        self._update_friction_buffers_at_index(i, row)
+
         self._buf_idx = (i + 1) % size
         if int(getattr(self, '_buf_count', 0) or 0) < size:
             self._buf_count += 1
@@ -3778,6 +4235,14 @@ class MainWindow(QMainWindow):
             if scroll_live:
                 try:
                     self.plot.setXRange(x_left, x_right, padding=0.0)
+                except Exception:
+                    pass
+                try:
+                    self.friction_plot.setXRange(x_left, x_right, padding=0.0)
+                except Exception:
+                    pass
+                try:
+                    self.mu_plot.setXRange(x_left, x_right, padding=0.0)
                 except Exception:
                     pass
             return
@@ -3929,6 +4394,11 @@ class MainWindow(QMainWindow):
             self.plot.setUpdatesEnabled(True)
             # Request a single repaint after updating all curves.
             self.plot.update()
+
+        try:
+            self._update_friction_plots(xs, idx, full, count, scroll_live, x_left, x_right)
+        except Exception:
+            pass
 
         self._last_plotted_seq = int(getattr(self, "_plot_seq", 0) or 0)
 
