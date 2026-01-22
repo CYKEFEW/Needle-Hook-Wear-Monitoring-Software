@@ -1118,8 +1118,8 @@ class SerialSimManagerWindow(QMainWindow):
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
 
-        self.btn_create.clicked.connect(self.create_port)
-        self.btn_remove.clicked.connect(self.remove_current)
+        self.btn_create.clicked.connect(lambda *_: self.create_port())
+        self.btn_remove.clicked.connect(lambda *_: self.remove_current())
 
         self.rebuild_tabs()
 
@@ -1344,8 +1344,8 @@ class SimPortWidget(QWidget):
         # signals
         self.cont_enable.toggled.connect(self._update_cont_timer)
         self.cont_interval.valueChanged.connect(self._update_cont_timer)
-        self.btn_fixed_once.clicked.connect(self.send_fixed_once)
-        self.btn_rand_once.clicked.connect(self.send_random_once)
+        self.btn_fixed_once.clicked.connect(lambda *_: self.send_fixed_once())
+        self.btn_rand_once.clicked.connect(lambda *_: self.send_random_once())
         self.tr_type.currentIndexChanged.connect(self._update_tr_ui)
         self._update_tr_ui()
         self._update_cont_timer()
@@ -1730,7 +1730,7 @@ class MainWindow(QMainWindow):
 
         self.port_combo = QComboBox()
         self.refresh_ports_btn = QPushButton("刷新串口")
-        self.refresh_ports_btn.clicked.connect(self.refresh_ports)
+        self.refresh_ports_btn.clicked.connect(lambda *_: self.refresh_ports())
 
         self.baud_combo = QComboBox()
         for b in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]:
@@ -1827,14 +1827,14 @@ class MainWindow(QMainWindow):
         # Connect / Acquire buttons
         btns = QHBoxLayout()
         self.connect_btn = QPushButton("连接串口")
-        self.connect_btn.clicked.connect(self.toggle_connect)
+        self.connect_btn.clicked.connect(lambda *_: self.toggle_connect())
 
         self.acquire_btn = QPushButton("开始采集")
-        self.acquire_btn.clicked.connect(self.toggle_acquire)
+        self.acquire_btn.clicked.connect(lambda *_: self.toggle_acquire())
         self.acquire_btn.setEnabled(False)
 
         self.pause_btn = QPushButton("暂停")
-        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.pause_btn.clicked.connect(lambda *_: self.toggle_pause())
         self.pause_btn.setEnabled(False)
 
         btns.addWidget(self.connect_btn)
@@ -1894,10 +1894,10 @@ class MainWindow(QMainWindow):
         self.plot_fps_spin.valueChanged.connect(self._on_plot_fps_changed)
 
         self.clear_btn = QPushButton("清空数据")
-        self.clear_btn.clicked.connect(self.clear_data)
+        self.clear_btn.clicked.connect(lambda *_: self.clear_data())
 
         self.save_btn = QPushButton("保存为 XLSX")
-        self.save_btn.clicked.connect(self.save_xlsx)
+        self.save_btn.clicked.connect(lambda *_: self.save_xlsx())
 
         pgd.addWidget(QLabel("当前窗口最大点数"), 0, 0)
         pgd.addWidget(self.max_points_spin, 0, 1)
@@ -1924,8 +1924,8 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.add_ch_btn = QPushButton("添加通道")
         self.del_ch_btn = QPushButton("删除选中")
-        self.add_ch_btn.clicked.connect(self.add_channel_row)
-        self.del_ch_btn.clicked.connect(self.delete_selected_rows)
+        self.add_ch_btn.clicked.connect(lambda *_: self.add_channel_row())
+        self.del_ch_btn.clicked.connect(lambda *_: self.delete_selected_rows())
         btn_row.addWidget(self.add_ch_btn)
         btn_row.addWidget(self.del_ch_btn)
         btn_row.addStretch(1)
@@ -2003,9 +2003,9 @@ class MainWindow(QMainWindow):
 
         mon_btns = QHBoxLayout()
         self.mon_clear_btn = QPushButton("清空监视")
-        self.mon_clear_btn.clicked.connect(self.clear_monitor)
+        self.mon_clear_btn.clicked.connect(lambda *_: self.clear_monitor())
         self.mon_save_btn = QPushButton("保存日志")
-        self.mon_save_btn.clicked.connect(self.save_monitor_log)
+        self.mon_save_btn.clicked.connect(lambda *_: self.save_monitor_log())
         mon_btns.addWidget(self.mon_clear_btn)
         mon_btns.addWidget(self.mon_save_btn)
         mon_btns.addStretch(1)
@@ -2106,7 +2106,7 @@ class MainWindow(QMainWindow):
 
         log_btns = QHBoxLayout()
         self.custom_send_clear_btn = QPushButton("清空")
-        self.custom_send_clear_btn.clicked.connect(self.clear_custom_send_log)
+        self.custom_send_clear_btn.clicked.connect(lambda *_: self.clear_custom_send_log())
         log_btns.addWidget(self.custom_send_clear_btn)
         log_btns.addStretch(1)
         send_layout.addLayout(log_btns)
@@ -2208,16 +2208,16 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self.motor_dock)
         self.motor_dock.hide()  # default hidden
 
-        self.motor_enable_btn.clicked.connect(self.on_motor_enable)
-        self.motor_disable_btn.clicked.connect(self.on_motor_disable)
-        self.motor_forward_btn.clicked.connect(self.on_motor_forward)
-        self.motor_backward_btn.clicked.connect(self.on_motor_backward)
-        self.motor_speed_btn.clicked.connect(self.on_motor_speed)
-        self.motor_tension_btn.clicked.connect(self.on_motor_tension)
-        self.motor_pid_btn.clicked.connect(self.on_motor_pid)
-        self.motor_estop_btn.clicked.connect(self.on_motor_estop)
+        self.motor_enable_btn.clicked.connect(lambda *_: self.on_motor_enable())
+        self.motor_disable_btn.clicked.connect(lambda *_: self.on_motor_disable())
+        self.motor_forward_btn.clicked.connect(lambda *_: self.on_motor_forward())
+        self.motor_backward_btn.clicked.connect(lambda *_: self.on_motor_backward())
+        self.motor_speed_btn.clicked.connect(lambda *_: self.on_motor_speed())
+        self.motor_tension_btn.clicked.connect(lambda *_: self.on_motor_tension())
+        self.motor_pid_btn.clicked.connect(lambda *_: self.on_motor_pid())
+        self.motor_estop_btn.clicked.connect(lambda *_: self.on_motor_estop())
 
-        self.custom_send_btn.clicked.connect(self.send_custom_serial)
+        self.custom_send_btn.clicked.connect(lambda *_: self.send_custom_serial())
         self.custom_send_line.returnPressed.connect(self.send_custom_serial)
         self.custom_send_dock.visibilityChanged.connect(lambda vis: vis and (self.update_custom_send_ports() or True) and (self.schedule_custom_send_render(full=True) or True))
         self.custom_send_port_combo.currentIndexChanged.connect(lambda *_: self.schedule_custom_send_render(full=True))
@@ -2277,7 +2277,163 @@ class MainWindow(QMainWindow):
 
         # Keep layout stable (no left-panel width jitter) and restore last workspace state.
         self._apply_stable_widget_sizing()
-        QTimer.singleShot(0, self._restore_window_layout)
+
+        # Restore last workspace state only after the window is actually shown.
+        # Doing it too early (during __init__) may lead to incomplete first layout on some systems.
+        self._restored_once = False
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if getattr(self, "_restored_once", False):
+            return
+        self._restored_once = True
+        QTimer.singleShot(0, self._restore_after_show)
+    def _restore_after_show(self):
+        self._restore_window_layout()
+
+        # Fix: saved window position may be partially off-screen (negative Y, etc.)
+        self._ensure_frame_on_screen()
+        QTimer.singleShot(50, self._ensure_frame_on_screen)
+        QTimer.singleShot(180, self._ensure_frame_on_screen)
+
+        # Force a couple of layout/paint passes.
+        # On some systems (Windows + high DPI, and/or OpenGL-backed widgets), the very first
+        # frame may not fully lay out/paint until a resizeEvent happens (e.g. user drags border).
+        # We emulate that once, without changing the visible size.
+        self._force_first_layout_pass()
+        QTimer.singleShot(0, self._force_first_layout_pass)
+
+    def _force_first_layout_pass(self):
+        # Activate central layout
+        try:
+            cw = self.centralWidget()
+            if cw:
+                try:
+                    cw.updateGeometry()
+                except Exception:
+                    pass
+                if cw.layout():
+                    cw.layout().activate()
+        except Exception:
+            pass
+
+        # Stabilize splitter geometry
+        try:
+            if hasattr(self, "main_splitter") and self.main_splitter is not None:
+                try:
+                    self.main_splitter.updateGeometry()
+                except Exception:
+                    pass
+                # Re-apply current sizes to force internal recompute
+                self.main_splitter.setSizes(self.main_splitter.sizes())
+                # Guard against a bad restored splitter state (e.g. one side nearly collapsed).
+                try:
+                    sizes = self.main_splitter.sizes()
+                    if isinstance(sizes, (list, tuple)) and len(sizes) >= 2:
+                        total = int(sizes[0]) + int(sizes[1])
+                        if total > 0 and (int(sizes[0]) < 180 or int(sizes[1]) < 180):
+                            left = max(360, int(total * 0.35))
+                            right = max(420, total - left)
+                            self.main_splitter.setSizes([left, right])
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        # Flush pending events once (first-show only)
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        # Nudge window size (triggers resizeEvent like a manual border drag)
+        try:
+            is_max = getattr(self, "isMaximized", lambda: False)()
+            is_full = getattr(self, "isFullScreen", lambda: False)()
+            if not is_max and not is_full:
+                w, h = int(self.width()), int(self.height())
+                self.resize(w + 1, h + 1)
+                self.resize(w, h)
+        except Exception:
+            pass
+
+        # Help plotting widget settle (pyqtgraph / OpenGL)
+        try:
+            if hasattr(self, "plot") and self.plot is not None:
+                try:
+                    self.plot.updateGeometry()
+                except Exception:
+                    pass
+                self.plot.update()
+                try:
+                    self.plot.repaint()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            self.update()
+            self.repaint()
+        except Exception:
+            pass
+
+        # Ensure the restored window frame is fully visible on the current screen
+        # (fixes cases where QSettings restored a negative Y, etc.)
+        self._ensure_frame_on_screen()
+
+    def _ensure_frame_on_screen(self):
+        """Keep the window frame inside the current screen's available area.
+
+        This fixes cases where a previously saved QSettings window position is restored with
+        a negative Y (top clipped) or otherwise partially off-screen. We clamp using the
+        *frameGeometry* (including title bar) rather than the client geometry.
+        """
+        try:
+            # Don't interfere with maximized/fullscreen states
+            try:
+                if getattr(self, "isMaximized", lambda: False)() or getattr(self, "isFullScreen", lambda: False)():
+                    return
+            except Exception:
+                pass
+
+            screen = None
+            try:
+                screen = self.screen()
+            except Exception:
+                screen = None
+            if screen is None:
+                try:
+                    screen = QApplication.primaryScreen()
+                except Exception:
+                    screen = None
+            if screen is None:
+                return
+
+            avail = screen.availableGeometry()
+            fg = self.frameGeometry()
+
+            x, y = int(fg.x()), int(fg.y())
+            w, h = int(fg.width()), int(fg.height())
+
+            # If it's totally outside, re-center
+            if (x + w) < (avail.left() + 20) or x > (avail.left() + avail.width() - 20) or (y + h) < (avail.top() + 20) or y > (avail.top() + avail.height() - 20):
+                new_x = int(avail.left() + max(0, (avail.width() - w) // 2))
+                new_y = int(avail.top() + max(0, (avail.height() - h) // 2))
+                self.move(new_x, new_y)
+                return
+
+            # Clamp into available rect
+            max_x = int(avail.left() + max(0, avail.width() - w))
+            max_y = int(avail.top() + max(0, avail.height() - h))
+            new_x = min(max(x, int(avail.left())), max_x)
+            new_y = min(max(y, int(avail.top())), max_y)
+
+            if new_x != x or new_y != y:
+                self.move(new_x, new_y)
+        except Exception:
+            pass
 
     def open_simulator(self):
         """打开串口仿真界面（可同时仿真多个串口）。"""
