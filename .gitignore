@@ -1,3 +1,4 @@
 dist/
 build/
 data_logs/
+__pycache__/

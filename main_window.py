@@ -2521,7 +2521,7 @@ class MainWindow(QMainWindow):
         self.ch_table.setCellWidget(row, 5, word_combo)
 
         self.ch_table.setItem(row, 6, QTableWidgetItem("-0.01"))
-        self.ch_table.setItem(row, 7, QTableWidgetItem("g"))
+        self.ch_table.setItem(row, 7, QTableWidgetItem("N"))
 
         self._refresh_friction_channel_options()
     def delete_selected_rows(self):
@@ -3251,12 +3251,8 @@ class MainWindow(QMainWindow):
         for idx, name in enumerate(self.channel_names):
             unit = units[idx] if idx < len(units) else ""
             unit_label = self._unit_label(unit)
-            if unit and unit.strip().lower() == "g":
-                headers.append(f"{name}({self._unit_label('g')})")
-                headers.append(f"{name}({self._unit_label('N')})")
-            else:
-                headers.append(f"{name}({unit_label})" if unit_label else name)
-        headers += ["摩擦力(g【克】)", "摩擦力(N【牛】)", "摩擦系数"]
+            headers.append(f"{name}({unit_label})" if unit_label else name)
+        headers += ["摩擦力(N【牛】)", "摩擦系数"]
         for i, h in enumerate(headers, start=1):
             ws_all.cell(row=1, column=i, value=h)
 
@@ -3275,21 +3271,8 @@ class MainWindow(QMainWindow):
                 col = ys_map.get(name, [])
                 v = col[r - 2] if (r - 2) < len(col) else None
                 row_vals.append(v)
-                unit = units[c - 2] if (c - 2) < len(units) else ""
-                if unit and unit.strip().lower() == "g":
-                    ws_all.cell(row=r, column=col_idx, value=v)
-                    col_idx += 1
-                    v_n = None
-                    if v is not None:
-                        try:
-                            v_n = float(v) * 0.00980665
-                        except Exception:
-                            v_n = None
-                    ws_all.cell(row=r, column=col_idx, value=v_n)
-                    col_idx += 1
-                else:
-                    ws_all.cell(row=r, column=col_idx, value=v)
-                    col_idx += 1
+                ws_all.cell(row=r, column=col_idx, value=v)
+                col_idx += 1
 
             # friction / mu
             high_v = None
@@ -3304,51 +3287,29 @@ class MainWindow(QMainWindow):
                     low_v = row_vals[self.channel_names.index(lo_name)]
                 except Exception:
                     low_v = None
-            fric_g, mu = self._calc_fric_mu(high_v, low_v)
-            fric_n = None
-            if fric_g is not None:
-                try:
-                    fric_n = float(fric_g) * 0.00980665
-                except Exception:
-                    fric_n = None
-            ws_all.cell(row=r, column=col_idx, value=fric_g)
-            ws_all.cell(row=r, column=col_idx + 1, value=fric_n)
-            ws_all.cell(row=r, column=col_idx + 2, value=mu)
+            fric_n, mu = self._calc_fric_mu(high_v, low_v)
+            ws_all.cell(row=r, column=col_idx, value=fric_n)
+            ws_all.cell(row=r, column=col_idx + 1, value=mu)
 
         # per-channel sheets (small data only)
         for i, name in enumerate(self.channel_names):
             ws = wb.create_sheet(title=self._safe_sheet_name(name))
             ws.cell(row=1, column=1, value="Time")
             unit = units[i] if i < len(units) else ""
-            if unit and unit.strip().lower() == "g":
-                ws.cell(row=1, column=2, value=f"{name}({self._unit_label('g')})")
-                ws.cell(row=1, column=3, value=f"{name}({self._unit_label('N')})")
-            else:
-                unit_label = self._unit_label(unit)
-                ws.cell(row=1, column=2, value=f"{name}({unit_label})" if unit_label else name)
+            unit_label = self._unit_label(unit)
+            ws.cell(row=1, column=2, value=f"{name}({unit_label})" if unit_label else name)
             vals = ys_map.get(name, [])
             for r in range(nrows):
                 wall_ts = xs_wall[r] if xs_wall and r < len(xs_wall) else None
                 t_str = self._format_export_time(wall_ts, xs[r])
                 ws.cell(row=r + 2, column=1, value=t_str)
                 v = vals[r] if r < len(vals) else None
-                if unit and unit.strip().lower() == "g":
-                    ws.cell(row=r + 2, column=2, value=v)
-                    v_n = None
-                    if v is not None:
-                        try:
-                            v_n = float(v) * 0.00980665
-                        except Exception:
-                            v_n = None
-                    ws.cell(row=r + 2, column=3, value=v_n)
-                else:
-                    ws.cell(row=r + 2, column=2, value=v)
+                ws.cell(row=r + 2, column=2, value=v)
 
         # friction sheet
         ws_f = wb.create_sheet(title="摩擦力")
         ws_f.cell(row=1, column=1, value="Time")
-        ws_f.cell(row=1, column=2, value="摩擦力(g【克】)")
-        ws_f.cell(row=1, column=3, value="摩擦力(N【牛】)")
+        ws_f.cell(row=1, column=2, value="摩擦力(N【牛】)")
         ws_mu = wb.create_sheet(title="摩擦系数")
         ws_mu.cell(row=1, column=1, value="Time")
         ws_mu.cell(row=1, column=2, value="摩擦系数")
@@ -3356,7 +3317,7 @@ class MainWindow(QMainWindow):
             wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
             # recompute with current config
-            fric_g = None
+            fric_n = None
             mu = None
             if hi_name and lo_name and hi_name in ys_map and lo_name in ys_map:
                 try:
@@ -3365,16 +3326,9 @@ class MainWindow(QMainWindow):
                 except Exception:
                     hv = None
                     lv = None
-                fric_g, mu = self._calc_fric_mu(hv, lv)
-            fric_n = None
-            if fric_g is not None:
-                try:
-                    fric_n = float(fric_g) * 0.00980665
-                except Exception:
-                    fric_n = None
+                fric_n, mu = self._calc_fric_mu(hv, lv)
             ws_f.cell(row=r, column=1, value=t_str)
-            ws_f.cell(row=r, column=2, value=fric_g)
-            ws_f.cell(row=r, column=3, value=fric_n)
+            ws_f.cell(row=r, column=2, value=fric_n)
             ws_mu.cell(row=r, column=1, value=t_str)
             ws_mu.cell(row=r, column=2, value=mu)
 
@@ -3414,15 +3368,11 @@ class MainWindow(QMainWindow):
             for idx, name in enumerate(channel_names):
                 unit = channel_units[idx] if idx < len(channel_units) else ""
                 unit_label = self._unit_label(unit)
-                if unit and unit.strip().lower() == "g":
-                    headers.append(f"{name}({self._unit_label('g')})")
-                    headers.append(f"{name}({self._unit_label('N')})")
-                else:
-                    headers.append(f"{name}({unit_label})" if unit_label else name)
-            headers += ["摩擦力(g【克】)", "摩擦力(N【牛】)", "摩擦系数"]
+                headers.append(f"{name}({unit_label})" if unit_label else name)
+            headers += ["摩擦力(N【牛】)", "摩擦系数"]
             ws_all.append(headers)
             ws_f = wb.create_sheet("摩擦力")
-            ws_f.append(["Time", "摩擦力(g【克】)", "摩擦力(N【牛】)"])
+            ws_f.append(["Time", "摩擦力(N【牛】)"])
             ws_mu = wb.create_sheet("摩擦系数")
             ws_mu.append(["Time", "摩擦系数"])
 
@@ -3443,33 +3393,15 @@ class MainWindow(QMainWindow):
                     t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts_val)))
                     high_v = vals[hi_idx] if (hi_idx is not None and hi_idx < len(vals)) else None
                     low_v = vals[lo_idx] if (lo_idx is not None and lo_idx < len(vals)) else None
-                    fric_g, mu = self._calc_fric_mu(high_v, low_v)
-                    fric_n = None
-                    if fric_g is not None:
-                        try:
-                            fric_n = float(fric_g) * 0.00980665
-                        except Exception:
-                            fric_n = None
-
                     row_out = [t_str]
                     for idx, name in enumerate(channel_names):
                         v = vals[idx] if idx < len(vals) else None
-                        unit = channel_units[idx] if idx < len(channel_units) else ""
-                        if unit and unit.strip().lower() == "g":
-                            row_out.append(v)
-                            v_n = None
-                            if v is not None:
-                                try:
-                                    v_n = float(v) * 0.00980665
-                                except Exception:
-                                    v_n = None
-                            row_out.append(v_n)
-                        else:
-                            row_out.append(v)
+                        row_out.append(v)
 
-                    row_out += [fric_g, fric_n, mu]
+                    fric_n, mu = self._calc_fric_mu(high_v, low_v)
+                    row_out += [fric_n, mu]
                     ws_all.append(row_out)
-                    ws_f.append([t_str, fric_g, fric_n])
+                    ws_f.append([t_str, fric_n])
                     ws_mu.append([t_str, mu])
 
             wb.save(path)
