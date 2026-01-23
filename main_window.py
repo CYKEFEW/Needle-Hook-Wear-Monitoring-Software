@@ -5,6 +5,7 @@ import math
 import os
 import sqlite3
 import time
+import unicodedata
 from typing import Dict, List, Optional
 
 import pyqtgraph as pg
@@ -13,7 +14,7 @@ from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
 import serial
 from serial.tools import list_ports
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
 # Optional: numpy speeds up plotting at high rates
@@ -160,9 +161,9 @@ class MainWindow(QMainWindow):
 
         # Monitor enable for comm monitor (rx/tx)
         self.mon_rx_chk = QCheckBox("监听")
-        self.mon_rx_chk.setChecked(True)
+        self.mon_rx_chk.setChecked(False)
         self.mon_tx_chk = QCheckBox("监听")
-        self.mon_tx_chk.setChecked(True)
+        self.mon_tx_chk.setChecked(False)
 
         sg.addWidget(QLabel("接收串口(Modbus)"), 0, 0)
         sg.addWidget(self.port_combo, 0, 1)
@@ -438,6 +439,25 @@ class MainWindow(QMainWindow):
         self.mu_tab = QWidget()
         mu_layout = QVBoxLayout(self.mu_tab)
         mu_layout.setContentsMargins(0, 0, 0, 0)
+        mu_cfg = QGridLayout()
+        self.mu_high_combo = QComboBox()
+        self.mu_low_combo = QComboBox()
+        self.mu_swap_btn = QPushButton("互换")
+        self.mu_wrap_angle_spin = QDoubleSpinBox()
+        self.mu_wrap_angle_spin.setDecimals(2)
+        self.mu_wrap_angle_spin.setRange(0.0, 360.0)
+        self.mu_wrap_angle_spin.setSingleStep(1.0)
+        self.mu_wrap_angle_spin.setValue(0.0)
+        self.mu_wrap_angle_spin.setSuffix(" °")
+        mu_cfg.addWidget(QLabel("高张力侧"), 0, 0)
+        mu_cfg.addWidget(self.mu_high_combo, 0, 1)
+        mu_cfg.addWidget(QLabel("低张力侧"), 0, 2)
+        mu_cfg.addWidget(self.mu_low_combo, 0, 3)
+        mu_cfg.addWidget(self.mu_swap_btn, 0, 4)
+        mu_cfg.addWidget(QLabel("包角"), 1, 0)
+        mu_cfg.addWidget(self.mu_wrap_angle_spin, 1, 1)
+        mu_cfg.setColumnStretch(5, 1)
+        mu_layout.addLayout(mu_cfg)
         mu_layout.addWidget(self.mu_plot, 1)
 
         self.plot_dock = QDockWidget("绘图窗口", self)
@@ -457,6 +477,10 @@ class MainWindow(QMainWindow):
         self.fric_low_combo.currentIndexChanged.connect(self._on_friction_config_changed)
         self.wrap_angle_spin.valueChanged.connect(self._on_friction_config_changed)
         self.fric_swap_btn.clicked.connect(self._swap_friction_channels)
+        self.mu_high_combo.currentIndexChanged.connect(self._on_mu_config_changed)
+        self.mu_low_combo.currentIndexChanged.connect(self._on_mu_config_changed)
+        self.mu_wrap_angle_spin.valueChanged.connect(self._on_mu_config_changed)
+        self.mu_swap_btn.clicked.connect(self._swap_mu_channels)
 
         # ---- Comm Monitor Dock ----
         self.monitor_dock = QDockWidget("通讯监视窗口", self)
@@ -1405,8 +1429,12 @@ class MainWindow(QMainWindow):
 
         cur_high = self.fric_high_combo.currentText() if hasattr(self, "fric_high_combo") else ""
         cur_low = self.fric_low_combo.currentText() if hasattr(self, "fric_low_combo") else ""
+        cur_high_mu = self.mu_high_combo.currentText() if hasattr(self, "mu_high_combo") else ""
+        cur_low_mu = self.mu_low_combo.currentText() if hasattr(self, "mu_low_combo") else ""
 
-        for combo in [self.fric_high_combo, self.fric_low_combo]:
+        for combo in [self.fric_high_combo, self.fric_low_combo, getattr(self, "mu_high_combo", None), getattr(self, "mu_low_combo", None)]:
+            if combo is None:
+                continue
             try:
                 combo.blockSignals(True)
                 combo.clear()
@@ -1431,6 +1459,10 @@ class MainWindow(QMainWindow):
                 self.fric_high_combo.setCurrentText(cur_high)
             if cur_low and cur_low in names:
                 self.fric_low_combo.setCurrentText(cur_low)
+            if cur_high_mu and cur_high_mu in names and hasattr(self, "mu_high_combo"):
+                self.mu_high_combo.setCurrentText(cur_high_mu)
+            if cur_low_mu and cur_low_mu in names and hasattr(self, "mu_low_combo"):
+                self.mu_low_combo.setCurrentText(cur_low_mu)
         except Exception:
             pass
 
@@ -1450,6 +1482,64 @@ class MainWindow(QMainWindow):
             pass
         self._on_friction_config_changed()
 
+    def _swap_mu_channels(self):
+        try:
+            if not self.mu_high_combo.isEnabled() or not self.mu_low_combo.isEnabled():
+                return
+            hi = self.mu_high_combo.currentIndex()
+            lo = self.mu_low_combo.currentIndex()
+            if hi < 0 or lo < 0:
+                return
+            self.mu_high_combo.setCurrentIndex(lo)
+            self.mu_low_combo.setCurrentIndex(hi)
+        except Exception:
+            pass
+        self._on_mu_config_changed()
+
+    def _sync_mu_from_fric(self):
+        if not hasattr(self, "mu_high_combo"):
+            return
+        try:
+            self.mu_high_combo.blockSignals(True)
+            self.mu_low_combo.blockSignals(True)
+            self.mu_wrap_angle_spin.blockSignals(True)
+            if self.mu_high_combo.isEnabled():
+                self.mu_high_combo.setCurrentText(self.fric_high_combo.currentText())
+            if self.mu_low_combo.isEnabled():
+                self.mu_low_combo.setCurrentText(self.fric_low_combo.currentText())
+            self.mu_wrap_angle_spin.setValue(self.wrap_angle_spin.value())
+        except Exception:
+            pass
+        finally:
+            try:
+                self.mu_high_combo.blockSignals(False)
+                self.mu_low_combo.blockSignals(False)
+                self.mu_wrap_angle_spin.blockSignals(False)
+            except Exception:
+                pass
+
+    def _sync_fric_from_mu(self):
+        if not hasattr(self, "fric_high_combo"):
+            return
+        try:
+            self.fric_high_combo.blockSignals(True)
+            self.fric_low_combo.blockSignals(True)
+            self.wrap_angle_spin.blockSignals(True)
+            if self.fric_high_combo.isEnabled():
+                self.fric_high_combo.setCurrentText(self.mu_high_combo.currentText())
+            if self.fric_low_combo.isEnabled():
+                self.fric_low_combo.setCurrentText(self.mu_low_combo.currentText())
+            self.wrap_angle_spin.setValue(self.mu_wrap_angle_spin.value())
+        except Exception:
+            pass
+        finally:
+            try:
+                self.fric_high_combo.blockSignals(False)
+                self.fric_low_combo.blockSignals(False)
+                self.wrap_angle_spin.blockSignals(False)
+            except Exception:
+                pass
+
     def _on_friction_config_changed(self, *args):
         try:
             self._fric_high_name = (self.fric_high_combo.currentText() or "").strip()
@@ -1466,6 +1556,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self._wrap_angle_rad = 0.0
 
+        self._sync_mu_from_fric()
         self._recalc_friction_buffers()
         try:
             self._plot_seq = int(getattr(self, "_plot_seq", 0) or 0) + 1
@@ -1476,6 +1567,10 @@ class MainWindow(QMainWindow):
             self.update_plot()
         except Exception:
             pass
+
+    def _on_mu_config_changed(self, *args):
+        self._sync_fric_from_mu()
+        self._on_friction_config_changed()
 
     def _calc_fric_mu(self, high_v, low_v):
         try:
@@ -3380,6 +3475,10 @@ class MainWindow(QMainWindow):
             wb.save(path)
         finally:
             conn.close()
+        try:
+            self._autosize_workbook(path)
+        except Exception:
+            pass
 
     # ---------- export ----------
     def save_xlsx(self):
@@ -3418,15 +3517,32 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _autosize_sheet(ws):
-        max_rows = min(ws.max_row, 200)
+        max_rows = min(ws.max_row, 2)
         for col in range(1, ws.max_column + 1):
             max_len = 0
             for row in range(1, max_rows + 1):
                 v = ws.cell(row=row, column=col).value
                 if v is None:
                     continue
-                max_len = max(max_len, len(str(v)))
-            ws.column_dimensions[get_column_letter(col)].width = min(max(10, max_len + 2), 40)
+                s = str(v)
+                # Count CJK wide chars as width=2 for better Excel column sizing
+                width = 0
+                for ch in s:
+                    width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+                max_len = max(max_len, width)
+            ws.column_dimensions[get_column_letter(col)].width = min(max(10, max_len + 2), 50)
+
+    def _autosize_workbook(self, path: str):
+        wb = load_workbook(path)
+        try:
+            for ws in wb.worksheets:
+                self._autosize_sheet(ws)
+            wb.save(path)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         # Persist workspace layout (dock positions / splitter sizes / window geometry)
