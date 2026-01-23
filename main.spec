@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['main.py'],
-    pathex=[],
+    ['app.py'],
+    pathex=['.'],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['PySide6.QtOpenGL', 'PySide6.QtOpenGLWidgets'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
