@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('app.ico', '.')],
     hiddenimports=['PySide6.QtOpenGL', 'PySide6.QtOpenGLWidgets'],
     hookspath=[],
     hooksconfig={},
