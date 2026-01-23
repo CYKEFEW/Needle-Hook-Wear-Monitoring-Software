@@ -2,6 +2,8 @@
 """Main UI window for Modbus assistant."""
 
 import math
+import os
+import sqlite3
 import time
 from typing import Dict, List, Optional
 
@@ -33,6 +35,7 @@ from rs485 import Rs485CtrlConfig, Rs485CtrlMode
 from virtual_serial import SIM_REGISTRY
 from worker import ModbusRtuWorker
 from sim_window import SerialSimManagerWindow
+from data_logger import DataLogger
 
 class MainWindow(QMainWindow):
 
@@ -58,6 +61,7 @@ class MainWindow(QMainWindow):
         self._buf_count = 0
         self._buf_idx = 0  # next write index
         self._ts_buf = None  # numpy array or list
+        self._ts_wall_buf = None  # wall-clock seconds (epoch)
         self._val_buf_by_channel: Dict[str, object] = {}  # name -> np.ndarray or list
         self._plot_x = None  # contiguous x for plotting (numpy)
         self._plot_y_by_channel: Dict[str, object] = {}  # name -> np.ndarray or list
@@ -81,6 +85,9 @@ class MainWindow(QMainWindow):
         self._fric_low_name = ""
         self._wrap_angle_deg = 0.0
         self._wrap_angle_rad = 0.0
+        self._data_logger = DataLogger(base_dir=os.path.join(os.getcwd(), "data_logs"))
+        self._log_db_path = ""
+        self._log_channels: List[str] = []
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -1687,10 +1694,10 @@ class MainWindow(QMainWindow):
         old_size = int(getattr(self, '_buf_size', 0) or 0)
         if new_size <= 0 or new_size == old_size:
             return
-        xs, ys_map = self._snapshot_ring()
-        self._alloc_ring_buffers(new_size, list(self.channel_names), keep_last=True, xs=xs, ys_map=ys_map)
+        xs, ys_map, xs_wall = self._snapshot_ring(include_wall=True)
+        self._alloc_ring_buffers(new_size, list(self.channel_names), keep_last=True, xs=xs, ys_map=ys_map, xs_wall=xs_wall)
 
-    def _alloc_ring_buffers(self, size: int, channel_names: list, keep_last: bool = False, xs=None, ys_map=None):
+    def _alloc_ring_buffers(self, size: int, channel_names: list, keep_last: bool = False, xs=None, ys_map=None, xs_wall=None):
         """Allocate ring buffers.
 
         When keep_last=True, copies the last min(len(xs), size) samples into the new buffer.
@@ -1704,9 +1711,11 @@ class MainWindow(QMainWindow):
 
         if np is not None:
             self._ts_buf = np.full(size, np.nan, dtype=float)
+            self._ts_wall_buf = np.full(size, np.nan, dtype=float)
             self._plot_x = np.empty(size, dtype=float)
         else:
             self._ts_buf = [None] * size
+            self._ts_wall_buf = [None] * size
             self._plot_x = None
 
         if np is not None:
@@ -1740,6 +1749,18 @@ class MainWindow(QMainWindow):
                     self._ts_buf[:k] = np.asarray(tail_x, dtype=float)
                 else:
                     self._ts_buf[:k] = list(tail_x)
+                if xs_wall:
+                    try:
+                        tail_w = xs_wall[-k:]
+                    except Exception:
+                        tail_w = []
+                else:
+                    tail_w = []
+                if tail_w:
+                    if np is not None:
+                        self._ts_wall_buf[:k] = np.asarray(tail_w, dtype=float)
+                    else:
+                        self._ts_wall_buf[:k] = list(tail_w)
 
                 for name in channel_names:
                     ys = (ys_map or {}).get(name, [])
@@ -1782,11 +1803,13 @@ class MainWindow(QMainWindow):
                 self._buf_count = k
                 self._buf_idx = k % size
 
-    def _snapshot_ring(self):
+    def _snapshot_ring(self, include_wall: bool = False):
         """Snapshot ring buffer into time-ordered python lists (for resize/export)."""
         count = int(getattr(self, '_buf_count', 0) or 0)
         size = int(getattr(self, '_buf_size', 0) or 0)
         if count <= 0 or size <= 0 or self._ts_buf is None:
+            if include_wall:
+                return [], {}, []
             return [], {}
         idx = int(getattr(self, '_buf_idx', 0) or 0)
 
@@ -1802,6 +1825,25 @@ class MainWindow(QMainWindow):
                 xs = [float(x) for x in self._ts_buf[idx:]] + [float(x) for x in self._ts_buf[:idx]]
             else:
                 xs = list(self._ts_buf[idx:]) + list(self._ts_buf[:idx])
+
+        xs_wall = []
+        if include_wall:
+            buf = self._ts_wall_buf
+            if buf is None:
+                xs_wall = []
+            else:
+                if count < size:
+                    if np is not None:
+                        arr = buf[:count]
+                        xs_wall = [None if (not np.isfinite(v)) else float(v) for v in arr]
+                    else:
+                        xs_wall = list(buf[:count])
+                else:
+                    if np is not None:
+                        arr = list(buf[idx:]) + list(buf[:idx])
+                        xs_wall = [None if (not np.isfinite(v)) else float(v) for v in arr]
+                    else:
+                        xs_wall = list(buf[idx:]) + list(buf[:idx])
 
         ys_map = {}
         for name in list(self.channel_names):
@@ -1820,6 +1862,8 @@ class MainWindow(QMainWindow):
                 else:
                     ys = list(buf[idx:]) + list(buf[:idx])
             ys_map[name] = ys
+        if include_wall:
+            return xs, ys_map, xs_wall
         return xs, ys_map
 
     # ---------- monitor ----------
@@ -2513,6 +2557,10 @@ class MainWindow(QMainWindow):
             rel_ts = 0.0
         self._last_sample_rel_ts = rel_ts
         self._last_sample_mono_ts = float(mono_now)
+        try:
+            wall_ts = float(ts) if ts is not None else time.time()
+        except Exception:
+            wall_ts = time.time()
 
         # Lazily init curves + buffers on first frame (兼容未点击开始采集时的数据)
         if not self.channel_names:
@@ -2543,6 +2591,15 @@ class MainWindow(QMainWindow):
                 self._ts_buf[i] = float(rel_ts)
             except Exception:
                 self._ts_buf[i] = np.nan
+            try:
+                if self._ts_wall_buf is not None:
+                    self._ts_wall_buf[i] = float(wall_ts)
+            except Exception:
+                try:
+                    if self._ts_wall_buf is not None:
+                        self._ts_wall_buf[i] = np.nan
+                except Exception:
+                    pass
             for name in self.channel_names:
                 v = row.get(name, None)
                 try:
@@ -2551,11 +2608,18 @@ class MainWindow(QMainWindow):
                     self._val_buf_by_channel[name][i] = np.nan
         else:
             self._ts_buf[i] = rel_ts
+            if self._ts_wall_buf is not None:
+                self._ts_wall_buf[i] = wall_ts
             for name in self.channel_names:
                 self._val_buf_by_channel[name][i] = row.get(name, None)
 
         # update derived friction buffers
         self._update_friction_buffers_at_index(i, row)
+        try:
+            if getattr(self, "_log_db_path", ""):
+                self._data_logger.append(wall_ts, row)
+        except Exception:
+            pass
 
         self._buf_idx = (i + 1) % size
         if int(getattr(self, '_buf_count', 0) or 0) < size:
@@ -2854,6 +2918,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.worker = None
+        try:
+            self._stop_data_logger()
+        except Exception:
+            pass
 
         self.is_connected = False
         self.is_acquiring = False
@@ -2931,6 +2999,7 @@ class MainWindow(QMainWindow):
         except Exception:
             size = int(getattr(self, '_buf_size', 100) or 100)
         self._alloc_ring_buffers(size, list(self.channel_names), keep_last=False)
+        self._start_data_logger(self.channel_names)
 
         self.worker.set_acquiring(True)
         self.is_acquiring = True
@@ -2954,6 +3023,7 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(False)
         self.acquire_btn.setText("开始采集")
         self.set_status("已连接（未采集）")
+        self._stop_data_logger()
         try:
             self._update_plot_timer_running()
         except Exception:
@@ -3004,12 +3074,201 @@ class MainWindow(QMainWindow):
         self.is_acquiring = bool(on)
 
 
+    # ---------- data logging ----------
+    def _start_data_logger(self, channel_names: List[str]):
+        try:
+            if not channel_names:
+                return
+            path = self._data_logger.start_session(channel_names)
+            self._log_db_path = path
+            self._log_channels = list(channel_names)
+        except Exception:
+            self._log_db_path = ""
+            self._log_channels = []
+
+    def _stop_data_logger(self):
+        try:
+            if self._data_logger:
+                self._data_logger.stop()
+        except Exception:
+            pass
+
+    def _db_has_data(self, path: str) -> bool:
+        if not path:
+            return False
+        if not os.path.isfile(path):
+            return False
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                cur = conn.execute("SELECT 1 FROM data LIMIT 1")
+                return cur.fetchone() is not None
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+    def _format_export_time(self, wall_ts, rel_ts) -> str:
+        try:
+            if wall_ts is not None and math.isfinite(float(wall_ts)):
+                return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(wall_ts)))
+        except Exception:
+            pass
+        try:
+            return f"{float(rel_ts):.3f}s"
+        except Exception:
+            return ""
+
+    def _export_xlsx_from_ring(self, path: str, xs, ys_map, xs_wall):
+        wb = Workbook()
+        ws_all = wb.active
+        ws_all.title = "All"
+
+        headers = ["Time"] + list(self.channel_names)
+        headers += ["摩擦力", "摩擦系数"]
+        for i, h in enumerate(headers, start=1):
+            ws_all.cell(row=1, column=i, value=h)
+
+        nrows = len(xs)
+        hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
+        lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
+
+        for r, rel_ts in enumerate(xs, start=2):
+            wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
+            t_str = self._format_export_time(wall_ts, rel_ts)
+            ws_all.cell(row=r, column=1, value=t_str)
+
+            row_vals = []
+            for c, name in enumerate(self.channel_names, start=2):
+                col = ys_map.get(name, [])
+                v = col[r - 2] if (r - 2) < len(col) else None
+                ws_all.cell(row=r, column=c, value=v)
+                row_vals.append(v)
+
+            # friction / mu
+            high_v = None
+            low_v = None
+            if hi_name and hi_name in self.channel_names:
+                try:
+                    high_v = row_vals[self.channel_names.index(hi_name)]
+                except Exception:
+                    high_v = None
+            if lo_name and lo_name in self.channel_names:
+                try:
+                    low_v = row_vals[self.channel_names.index(lo_name)]
+                except Exception:
+                    low_v = None
+            fric, mu = self._calc_fric_mu(high_v, low_v)
+            ws_all.cell(row=r, column=len(self.channel_names) + 2, value=fric)
+            ws_all.cell(row=r, column=len(self.channel_names) + 3, value=mu)
+
+        # per-channel sheets (small data only)
+        for name in self.channel_names:
+            ws = wb.create_sheet(title=self._safe_sheet_name(name))
+            ws.cell(row=1, column=1, value="Time")
+            ws.cell(row=1, column=2, value="Value")
+            vals = ys_map.get(name, [])
+            for r in range(nrows):
+                wall_ts = xs_wall[r] if xs_wall and r < len(xs_wall) else None
+                t_str = self._format_export_time(wall_ts, xs[r])
+                ws.cell(row=r + 2, column=1, value=t_str)
+                ws.cell(row=r + 2, column=2, value=(vals[r] if r < len(vals) else None))
+
+        # friction sheet
+        ws_f = wb.create_sheet(title="摩擦力")
+        ws_f.cell(row=1, column=1, value="Time")
+        ws_f.cell(row=1, column=2, value="摩擦力")
+        ws_mu = wb.create_sheet(title="摩擦系数")
+        ws_mu.cell(row=1, column=1, value="Time")
+        ws_mu.cell(row=1, column=2, value="摩擦系数")
+        for r, rel_ts in enumerate(xs, start=2):
+            wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
+            t_str = self._format_export_time(wall_ts, rel_ts)
+            # recompute with current config
+            fric = None
+            mu = None
+            if hi_name and lo_name and hi_name in ys_map and lo_name in ys_map:
+                try:
+                    hv = ys_map.get(hi_name, [])[r - 2]
+                    lv = ys_map.get(lo_name, [])[r - 2]
+                except Exception:
+                    hv = None
+                    lv = None
+                fric, mu = self._calc_fric_mu(hv, lv)
+            ws_f.cell(row=r, column=1, value=t_str)
+            ws_f.cell(row=r, column=2, value=fric)
+            ws_mu.cell(row=r, column=1, value=t_str)
+            ws_mu.cell(row=r, column=2, value=mu)
+
+        for ws in wb.worksheets:
+            self._autosize_sheet(ws)
+
+        wb.save(path)
+
+    def _export_xlsx_from_db(self, db_path: str, path: str):
+        # flush queued rows (best-effort)
+        try:
+            if self._data_logger:
+                self._data_logger.flush(wait=True, timeout=3.0)
+        except Exception:
+            pass
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.execute("SELECT idx, name FROM channels ORDER BY idx")
+            channel_names = [row[1] for row in cur.fetchall()]
+            n_ch = len(channel_names)
+            col_names = [f"ch{i}" for i in range(n_ch)]
+            cols_sql = ", ".join(["ts"] + col_names) if col_names else "ts"
+            query = f"SELECT {cols_sql} FROM data ORDER BY id"
+
+            wb = Workbook(write_only=True)
+            ws_all = wb.create_sheet("All")
+            ws_all.append(["Time"] + channel_names + ["摩擦力", "摩擦系数"])
+            ws_f = wb.create_sheet("摩擦力")
+            ws_f.append(["Time", "摩擦力"])
+            ws_mu = wb.create_sheet("摩擦系数")
+            ws_mu.append(["Time", "摩擦系数"])
+
+            hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
+            lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
+            name_to_idx = {name: i for i, name in enumerate(channel_names)}
+            hi_idx = name_to_idx.get(hi_name, None)
+            lo_idx = name_to_idx.get(lo_name, None)
+
+            cur = conn.execute(query)
+            while True:
+                rows = cur.fetchmany(1000)
+                if not rows:
+                    break
+                for row in rows:
+                    ts_val = row[0]
+                    vals = list(row[1:]) if n_ch > 0 else []
+                    t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts_val)))
+                    high_v = vals[hi_idx] if (hi_idx is not None and hi_idx < len(vals)) else None
+                    low_v = vals[lo_idx] if (lo_idx is not None and lo_idx < len(vals)) else None
+                    fric, mu = self._calc_fric_mu(high_v, low_v)
+                    ws_all.append([t_str] + vals + [fric, mu])
+                    ws_f.append([t_str, fric])
+                    ws_mu.append([t_str, mu])
+
+            wb.save(path)
+        finally:
+            conn.close()
+
     # ---------- export ----------
     def save_xlsx(self):
-        xs, ys_map = self._snapshot_ring()
-        if not xs or not self.channel_names:
-            QMessageBox.information(self, "提示", "当前没有可保存的数据。请先开始采集。")
-            return
+        db_path = self._log_db_path if getattr(self, "_log_db_path", "") else ""
+        use_db = self._db_has_data(db_path)
+
+        xs = []
+        ys_map = {}
+        xs_wall = []
+        if not use_db:
+            xs, ys_map, xs_wall = self._snapshot_ring(include_wall=True)
+            if not xs or not self.channel_names:
+                QMessageBox.information(self, "提示", "当前没有可保存的数据。请先开始采集。")
+                return
 
         path, _ = QFileDialog.getSaveFileName(self, "保存为 XLSX", "modbus_data.xlsx", "Excel Files (*.xlsx)")
         if not path:
@@ -3018,40 +3277,13 @@ class MainWindow(QMainWindow):
             path += ".xlsx"
 
         try:
-            wb = Workbook()
-            ws_all = wb.active
-            ws_all.title = "All"
-
-            ws_all.cell(row=1, column=1, value="Time")
-            for i, name in enumerate(self.channel_names, start=2):
-                ws_all.cell(row=1, column=i, value=name)
-
-            nrows = len(xs)
-            for r, ts in enumerate(xs, start=2):
-                t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
-                ws_all.cell(row=r, column=1, value=t_str)
-                for c, name in enumerate(self.channel_names, start=2):
-                    col = ys_map.get(name, [])
-                    v = col[r - 2] if (r - 2) < len(col) else None
-                    ws_all.cell(row=r, column=c, value=v)
-
-            for name in self.channel_names:
-                ws = wb.create_sheet(title=self._safe_sheet_name(name))
-                ws.cell(row=1, column=1, value="Time")
-                ws.cell(row=1, column=2, value="Value")
-                vals = ys_map.get(name, [])
-                for r in range(nrows):
-                    t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(xs[r])))
-                    ws.cell(row=r + 2, column=1, value=t_str)
-                    ws.cell(row=r + 2, column=2, value=(vals[r] if r < len(vals) else None))
-
-            for ws in wb.worksheets:
-                self._autosize_sheet(ws)
-
-            wb.save(path)
+            if use_db:
+                self._export_xlsx_from_db(db_path, path)
+            else:
+                self._export_xlsx_from_ring(path, xs, ys_map, xs_wall)
             self.set_status(f"已保存：{path}")
         except Exception as e:
-            QMessageBox.critical(self, "保存失败", f"保存 xlsx 失败：\n{e}")
+            QMessageBox.critical(self, "\u4fdd\u5b58\u5931\u8d25", f"\u4fdd\u5b58 xlsx \u5931\u8d25\uff1a\\n{e}")
 
     @staticmethod
     def _safe_sheet_name(name: str) -> str:
