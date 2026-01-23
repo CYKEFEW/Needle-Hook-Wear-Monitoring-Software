@@ -39,9 +39,10 @@ class DataLogger:
         with self._lock:
             return self._last_error
 
-    def start_session(self, channel_names: List[str]) -> str:
+    def start_session(self, channel_names: List[str], channel_units: Optional[List[str]] = None) -> str:
         self.stop()
         self.channel_names = list(channel_names or [])
+        units = list(channel_units or [])
 
         os.makedirs(self.base_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
@@ -51,11 +52,12 @@ class DataLogger:
         conn = sqlite3.connect(self.db_path)
         try:
             self._apply_pragmas(conn)
-            conn.execute("CREATE TABLE IF NOT EXISTS channels (idx INTEGER PRIMARY KEY, name TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS channels (idx INTEGER PRIMARY KEY, name TEXT, unit TEXT)")
             # clear and insert channel names for this session
             conn.execute("DELETE FROM channels")
             for idx, name in enumerate(self.channel_names):
-                conn.execute("INSERT INTO channels (idx, name) VALUES (?, ?)", (int(idx), str(name)))
+                unit = units[idx] if idx < len(units) else ""
+                conn.execute("INSERT INTO channels (idx, name, unit) VALUES (?, ?, ?)", (int(idx), str(name), str(unit)))
 
             col_defs = ", ".join([f"ch{idx} REAL" for idx in range(len(self.channel_names))])
             if col_defs:

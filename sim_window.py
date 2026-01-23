@@ -169,6 +169,7 @@ class SimPortWidget(QWidget):
         self.rand_mode = QComboBox()
         self.rand_mode.addItem('纯文本(逗号分隔)', 'text')
         self.rand_mode.addItem('Modbus模式(03响应帧)', 'modbus')
+        self.rand_mode.setCurrentIndex(1)
         self.rand_unit = QSpinBox()
         self.rand_unit.setRange(1, 247)
         self.rand_unit.setValue(1)

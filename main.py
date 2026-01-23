@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Entrypoint wrapper.
-
-This file is intentionally small; most code lives in modules next to it.
-"""
 
 from app import main
 

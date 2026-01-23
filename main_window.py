@@ -27,7 +27,8 @@ from qt_compat import (
     QSpinBox, QDoubleSpinBox, QCheckBox, QHBoxLayout, QVBoxLayout, QGridLayout,
     QGroupBox, QTableWidget, QTableWidgetItem, QMessageBox, QFileDialog,
     QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter,
-    QSizePolicy, QTimer, QSettings, QPoint, QTextCursor, QGuiApplication, Slot
+    QSizePolicy, QTimer, QSettings, QPoint, QTextCursor, QGuiApplication, QApplication,
+    Slot,
 )
 
 from modbus_utils import ChannelConfig, DTYPE_INFO, hex_bytes
@@ -88,6 +89,8 @@ class MainWindow(QMainWindow):
         self._data_logger = DataLogger(base_dir=os.path.join(os.getcwd(), "data_logs"))
         self._log_db_path = ""
         self._log_channels: List[str] = []
+        self._log_units: List[str] = []
+        self._last_unit_map: Dict[str, str] = {}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -299,9 +302,9 @@ class MainWindow(QMainWindow):
         left.addWidget(ch_box, 1)
         cl = QVBoxLayout(ch_box)
 
-        self.ch_table = QTableWidget(0, 7)
+        self.ch_table = QTableWidget(0, 8)
         self.ch_table.setHorizontalHeaderLabels([
-            "启用", "名称", "地址", "数据类型", "字节序(Word内)", "字顺序(Word间)", "缩放系数"
+            "启用", "名称", "地址", "数据类型", "字节序(Word内)", "字顺序(Word间)", "缩放系数", "单位"
         ])
         self.ch_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.ch_table.horizontalHeader().setStretchLastSection(True)
@@ -2423,6 +2426,7 @@ class MainWindow(QMainWindow):
         self.ch_table.setCellWidget(row, 5, word_combo)
 
         self.ch_table.setItem(row, 6, QTableWidgetItem("-0.01"))
+        self.ch_table.setItem(row, 7, QTableWidgetItem("g"))
 
         self._refresh_friction_channel_options()
     def delete_selected_rows(self):
@@ -2434,6 +2438,7 @@ class MainWindow(QMainWindow):
     def gather_channels(self) -> List[ChannelConfig]:
         channels: List[ChannelConfig] = []
         seen_names = set()
+        unit_map: Dict[str, str] = {}
         for r in range(self.ch_table.rowCount()):
             enabled_widget = self.ch_table.cellWidget(r, 0)
             enabled = bool(enabled_widget.isChecked()) if enabled_widget else True
@@ -2464,9 +2469,15 @@ class MainWindow(QMainWindow):
                 scale = float((self.ch_table.item(r, 6).text() if self.ch_table.item(r, 6) else "1.0").strip())
             except Exception:
                 scale = 1.0
+            try:
+                unit = (self.ch_table.item(r, 7).text() if self.ch_table.item(r, 7) else "").strip()
+            except Exception:
+                unit = ""
+            unit_map[name] = unit
 
             channels.append(ChannelConfig(enabled=enabled, name=name, address=address, dtype=dtype,
                                          byte_order=byte_order, word_order=word_order, scale=scale))
+        self._last_unit_map = unit_map
         return channels
 
 
@@ -2992,6 +3003,7 @@ class MainWindow(QMainWindow):
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
         self.channel_names = [c.name for c in enabled_channels]
+        self._log_units = [self._last_unit_map.get(c.name, "") for c in enabled_channels]
         self.init_curves(self.channel_names)
         # allocate ring buffer with current max points
         try:
@@ -2999,7 +3011,7 @@ class MainWindow(QMainWindow):
         except Exception:
             size = int(getattr(self, '_buf_size', 100) or 100)
         self._alloc_ring_buffers(size, list(self.channel_names), keep_last=False)
-        self._start_data_logger(self.channel_names)
+        self._start_data_logger(self.channel_names, self._log_units)
 
         self.worker.set_acquiring(True)
         self.is_acquiring = True
@@ -3075,16 +3087,18 @@ class MainWindow(QMainWindow):
 
 
     # ---------- data logging ----------
-    def _start_data_logger(self, channel_names: List[str]):
+    def _start_data_logger(self, channel_names: List[str], channel_units: Optional[List[str]] = None):
         try:
             if not channel_names:
                 return
-            path = self._data_logger.start_session(channel_names)
+            path = self._data_logger.start_session(channel_names, channel_units or [])
             self._log_db_path = path
             self._log_channels = list(channel_names)
+            self._log_units = list(channel_units or [])
         except Exception:
             self._log_db_path = ""
             self._log_channels = []
+            self._log_units = []
 
     def _stop_data_logger(self):
         try:
@@ -3119,13 +3133,35 @@ class MainWindow(QMainWindow):
         except Exception:
             return ""
 
+    def _unit_label(self, unit: str) -> str:
+        u = (unit or "").strip()
+        if not u:
+            return ""
+        ul = u.lower()
+        if ul == "g":
+            return "g【克】"
+        if ul == "n":
+            return "N【牛】"
+        if u in ("无量纲", "-"):
+            return "无量纲"
+        return f"{u}【单位】"
+
     def _export_xlsx_from_ring(self, path: str, xs, ys_map, xs_wall):
         wb = Workbook()
         ws_all = wb.active
         ws_all.title = "All"
 
-        headers = ["Time"] + list(self.channel_names)
-        headers += ["摩擦力", "摩擦系数"]
+        headers = ["Time"]
+        units = list(getattr(self, "_log_units", []))
+        for idx, name in enumerate(self.channel_names):
+            unit = units[idx] if idx < len(units) else ""
+            unit_label = self._unit_label(unit)
+            if unit and unit.strip().lower() == "g":
+                headers.append(f"{name}({self._unit_label('g')})")
+                headers.append(f"{name}({self._unit_label('N')})")
+            else:
+                headers.append(f"{name}({unit_label})" if unit_label else name)
+        headers += ["摩擦力(g【克】)", "摩擦力(N【牛】)", "摩擦系数"]
         for i, h in enumerate(headers, start=1):
             ws_all.cell(row=1, column=i, value=h)
 
@@ -3139,11 +3175,26 @@ class MainWindow(QMainWindow):
             ws_all.cell(row=r, column=1, value=t_str)
 
             row_vals = []
+            col_idx = 2
             for c, name in enumerate(self.channel_names, start=2):
                 col = ys_map.get(name, [])
                 v = col[r - 2] if (r - 2) < len(col) else None
-                ws_all.cell(row=r, column=c, value=v)
                 row_vals.append(v)
+                unit = units[c - 2] if (c - 2) < len(units) else ""
+                if unit and unit.strip().lower() == "g":
+                    ws_all.cell(row=r, column=col_idx, value=v)
+                    col_idx += 1
+                    v_n = None
+                    if v is not None:
+                        try:
+                            v_n = float(v) * 0.00980665
+                        except Exception:
+                            v_n = None
+                    ws_all.cell(row=r, column=col_idx, value=v_n)
+                    col_idx += 1
+                else:
+                    ws_all.cell(row=r, column=col_idx, value=v)
+                    col_idx += 1
 
             # friction / mu
             high_v = None
@@ -3158,26 +3209,51 @@ class MainWindow(QMainWindow):
                     low_v = row_vals[self.channel_names.index(lo_name)]
                 except Exception:
                     low_v = None
-            fric, mu = self._calc_fric_mu(high_v, low_v)
-            ws_all.cell(row=r, column=len(self.channel_names) + 2, value=fric)
-            ws_all.cell(row=r, column=len(self.channel_names) + 3, value=mu)
+            fric_g, mu = self._calc_fric_mu(high_v, low_v)
+            fric_n = None
+            if fric_g is not None:
+                try:
+                    fric_n = float(fric_g) * 0.00980665
+                except Exception:
+                    fric_n = None
+            ws_all.cell(row=r, column=col_idx, value=fric_g)
+            ws_all.cell(row=r, column=col_idx + 1, value=fric_n)
+            ws_all.cell(row=r, column=col_idx + 2, value=mu)
 
         # per-channel sheets (small data only)
-        for name in self.channel_names:
+        for i, name in enumerate(self.channel_names):
             ws = wb.create_sheet(title=self._safe_sheet_name(name))
             ws.cell(row=1, column=1, value="Time")
-            ws.cell(row=1, column=2, value="Value")
+            unit = units[i] if i < len(units) else ""
+            if unit and unit.strip().lower() == "g":
+                ws.cell(row=1, column=2, value=f"{name}({self._unit_label('g')})")
+                ws.cell(row=1, column=3, value=f"{name}({self._unit_label('N')})")
+            else:
+                unit_label = self._unit_label(unit)
+                ws.cell(row=1, column=2, value=f"{name}({unit_label})" if unit_label else name)
             vals = ys_map.get(name, [])
             for r in range(nrows):
                 wall_ts = xs_wall[r] if xs_wall and r < len(xs_wall) else None
                 t_str = self._format_export_time(wall_ts, xs[r])
                 ws.cell(row=r + 2, column=1, value=t_str)
-                ws.cell(row=r + 2, column=2, value=(vals[r] if r < len(vals) else None))
+                v = vals[r] if r < len(vals) else None
+                if unit and unit.strip().lower() == "g":
+                    ws.cell(row=r + 2, column=2, value=v)
+                    v_n = None
+                    if v is not None:
+                        try:
+                            v_n = float(v) * 0.00980665
+                        except Exception:
+                            v_n = None
+                    ws.cell(row=r + 2, column=3, value=v_n)
+                else:
+                    ws.cell(row=r + 2, column=2, value=v)
 
         # friction sheet
         ws_f = wb.create_sheet(title="摩擦力")
         ws_f.cell(row=1, column=1, value="Time")
-        ws_f.cell(row=1, column=2, value="摩擦力")
+        ws_f.cell(row=1, column=2, value="摩擦力(g【克】)")
+        ws_f.cell(row=1, column=3, value="摩擦力(N【牛】)")
         ws_mu = wb.create_sheet(title="摩擦系数")
         ws_mu.cell(row=1, column=1, value="Time")
         ws_mu.cell(row=1, column=2, value="摩擦系数")
@@ -3185,7 +3261,7 @@ class MainWindow(QMainWindow):
             wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
             # recompute with current config
-            fric = None
+            fric_g = None
             mu = None
             if hi_name and lo_name and hi_name in ys_map and lo_name in ys_map:
                 try:
@@ -3194,9 +3270,16 @@ class MainWindow(QMainWindow):
                 except Exception:
                     hv = None
                     lv = None
-                fric, mu = self._calc_fric_mu(hv, lv)
+                fric_g, mu = self._calc_fric_mu(hv, lv)
+            fric_n = None
+            if fric_g is not None:
+                try:
+                    fric_n = float(fric_g) * 0.00980665
+                except Exception:
+                    fric_n = None
             ws_f.cell(row=r, column=1, value=t_str)
-            ws_f.cell(row=r, column=2, value=fric)
+            ws_f.cell(row=r, column=2, value=fric_g)
+            ws_f.cell(row=r, column=3, value=fric_n)
             ws_mu.cell(row=r, column=1, value=t_str)
             ws_mu.cell(row=r, column=2, value=mu)
 
@@ -3215,8 +3298,16 @@ class MainWindow(QMainWindow):
 
         conn = sqlite3.connect(db_path)
         try:
-            cur = conn.execute("SELECT idx, name FROM channels ORDER BY idx")
-            channel_names = [row[1] for row in cur.fetchall()]
+            try:
+                cur = conn.execute("SELECT idx, name, unit FROM channels ORDER BY idx")
+                channel_rows = cur.fetchall()
+                channel_names = [row[1] for row in channel_rows]
+                channel_units = [row[2] if len(row) > 2 else "" for row in channel_rows]
+            except Exception:
+                cur = conn.execute("SELECT idx, name FROM channels ORDER BY idx")
+                channel_rows = cur.fetchall()
+                channel_names = [row[1] for row in channel_rows]
+                channel_units = ["" for _ in channel_rows]
             n_ch = len(channel_names)
             col_names = [f"ch{i}" for i in range(n_ch)]
             cols_sql = ", ".join(["ts"] + col_names) if col_names else "ts"
@@ -3224,9 +3315,19 @@ class MainWindow(QMainWindow):
 
             wb = Workbook(write_only=True)
             ws_all = wb.create_sheet("All")
-            ws_all.append(["Time"] + channel_names + ["摩擦力", "摩擦系数"])
+            headers = ["Time"]
+            for idx, name in enumerate(channel_names):
+                unit = channel_units[idx] if idx < len(channel_units) else ""
+                unit_label = self._unit_label(unit)
+                if unit and unit.strip().lower() == "g":
+                    headers.append(f"{name}({self._unit_label('g')})")
+                    headers.append(f"{name}({self._unit_label('N')})")
+                else:
+                    headers.append(f"{name}({unit_label})" if unit_label else name)
+            headers += ["摩擦力(g【克】)", "摩擦力(N【牛】)", "摩擦系数"]
+            ws_all.append(headers)
             ws_f = wb.create_sheet("摩擦力")
-            ws_f.append(["Time", "摩擦力"])
+            ws_f.append(["Time", "摩擦力(g【克】)", "摩擦力(N【牛】)"])
             ws_mu = wb.create_sheet("摩擦系数")
             ws_mu.append(["Time", "摩擦系数"])
 
@@ -3247,9 +3348,33 @@ class MainWindow(QMainWindow):
                     t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts_val)))
                     high_v = vals[hi_idx] if (hi_idx is not None and hi_idx < len(vals)) else None
                     low_v = vals[lo_idx] if (lo_idx is not None and lo_idx < len(vals)) else None
-                    fric, mu = self._calc_fric_mu(high_v, low_v)
-                    ws_all.append([t_str] + vals + [fric, mu])
-                    ws_f.append([t_str, fric])
+                    fric_g, mu = self._calc_fric_mu(high_v, low_v)
+                    fric_n = None
+                    if fric_g is not None:
+                        try:
+                            fric_n = float(fric_g) * 0.00980665
+                        except Exception:
+                            fric_n = None
+
+                    row_out = [t_str]
+                    for idx, name in enumerate(channel_names):
+                        v = vals[idx] if idx < len(vals) else None
+                        unit = channel_units[idx] if idx < len(channel_units) else ""
+                        if unit and unit.strip().lower() == "g":
+                            row_out.append(v)
+                            v_n = None
+                            if v is not None:
+                                try:
+                                    v_n = float(v) * 0.00980665
+                                except Exception:
+                                    v_n = None
+                            row_out.append(v_n)
+                        else:
+                            row_out.append(v)
+
+                    row_out += [fric_g, fric_n, mu]
+                    ws_all.append(row_out)
+                    ws_f.append([t_str, fric_g, fric_n])
                     ws_mu.append([t_str, mu])
 
             wb.save(path)
