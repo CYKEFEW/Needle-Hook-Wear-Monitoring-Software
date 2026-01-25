@@ -710,7 +710,7 @@ class MainWindow(QMainWindow):
 
         # Tension control
         tension_row = QHBoxLayout()
-        tension_row.addWidget(QLabel("张力(g)"))
+        tension_row.addWidget(QLabel("张力(N)"))
         self.motor_tension_edit = QLineEdit()
         self.motor_tension_edit.setPlaceholderText("例如 1")
         self.motor_tension_btn = QPushButton("张力控制")
