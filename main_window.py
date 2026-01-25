@@ -696,8 +696,6 @@ class MainWindow(QMainWindow):
         mode_row.addStretch(1)
         motor_layout.addLayout(mode_row)
 
-
-
         # Speed control
         speed_row = QHBoxLayout()
         speed_row.addWidget(QLabel("转速(RPM)"))
