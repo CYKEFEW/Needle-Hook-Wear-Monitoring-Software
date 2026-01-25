@@ -2474,8 +2474,11 @@ class MainWindow(QMainWindow):
     def on_motor_estop(self):
         if not self._motor_can_send():
             return
-        # Order: tension -> speed -> disable
+        # Order: set mode -> tension -> set mode -> speed -> disable
+        # Ensure mode is set before issuing F/Con commands.
+        self._send_motor_cmd("ConMode 0")
         self._send_motor_cmd("F 0")
+        self._send_motor_cmd("ConMode 1")
         self._send_motor_cmd("Con 0")
         self._send_motor_cmd("Disable")
         self.motor_mode = None

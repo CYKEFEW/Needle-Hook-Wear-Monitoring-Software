@@ -82,6 +82,12 @@ class ModbusRtuWorker(QThread):
         self._latest_lock = threading.Lock()
         self._tx_write_q: "queue.Queue[bytes]" = queue.Queue(maxsize=1)
         self._tx_writer_thread: Optional[threading.Thread] = None
+        # Serialize TX/output port access and allow pausing data sending
+        # while manual commands are in flight.
+        self._tx_ser_lock = threading.Lock()
+        self._tx_pause_lock = threading.Lock()
+        self._tx_pause_count = 0
+        self._tx_pause_event = threading.Event()
 
     # ---------- custom send (thread-safe enqueue from UI thread) ----------
     def enqueue_custom_send(self, target: str, text: str, add_crlf: bool):
@@ -234,36 +240,51 @@ class ModbusRtuWorker(QThread):
             # Many RS485 modules need RTS/DTR toggling to actually drive the bus (TX灯才会亮)。
             use_rs485_dir = (self.rs485_cfg.mode != Rs485CtrlMode.AUTO)
 
+            pause_tx = (target == "tx")
+            if pause_tx:
+                self._pause_tx_output()
+
             try:
-                if use_rs485_dir:
-                    try:
-                        apply_rs485_tx_level(ser, self.rs485_cfg)
-                        if self.rs485_cfg.pre_tx_ms > 0:
-                            time.sleep(self.rs485_cfg.pre_tx_ms / 1000.0)
-                    except Exception:
-                        pass
+                lock = self._tx_ser_lock if (target == "tx") else None
+                if lock is not None:
+                    lock.acquire()
+                try:
+                    if use_rs485_dir:
+                        try:
+                            apply_rs485_tx_level(ser, self.rs485_cfg)
+                            if self.rs485_cfg.pre_tx_ms > 0:
+                                time.sleep(self.rs485_cfg.pre_tx_ms / 1000.0)
+                        except Exception:
+                            pass
 
-                ser.write(payload)
-                ser.flush()
-                self._emit_frame("TX_MANUAL", payload, tag=tag, note=f"[{mode}]")
+                    ser.write(payload)
+                    ser.flush()
+                    self._emit_frame("TX_MANUAL", payload, tag=tag, note=f"[{mode}]")
 
-                if use_rs485_dir:
-                    try:
-                        if self.rs485_cfg.post_tx_ms > 0:
-                            time.sleep(self.rs485_cfg.post_tx_ms / 1000.0)
-                        apply_rs485_rx_level(ser, self.rs485_cfg)
-                    except Exception:
-                        pass
+                    if use_rs485_dir:
+                        try:
+                            if self.rs485_cfg.post_tx_ms > 0:
+                                time.sleep(self.rs485_cfg.post_tx_ms / 1000.0)
+                            apply_rs485_rx_level(ser, self.rs485_cfg)
+                        except Exception:
+                            pass
 
-                # listen for reply (best-effort)
-                reply = self._read_until_idle(ser, idle_ms=20, max_ms=200)
-                if reply:
-                    self._emit_frame("RX_MANUAL", reply, tag=tag)
-                else:
-                    self._emit_frame("RX_MANUAL", b"", tag=tag, note="<no reply>")
+                    # listen for reply (best-effort)
+                    reply = self._read_until_idle(ser, idle_ms=20, max_ms=200)
+                    if reply:
+                        self._emit_frame("RX_MANUAL", reply, tag=tag)
+                    else:
+                        self._emit_frame("RX_MANUAL", b"", tag=tag, note="<no reply>")
+
+                finally:
+                    if lock is not None:
+                        lock.release()
 
             except Exception as e:
                 self._emit_frame("TX_MANUAL", b"", tag=tag, note=f"<error> {e}")
+            finally:
+                if pause_tx:
+                    self._resume_tx_output()
 
             processed += 1
 
@@ -297,6 +318,25 @@ class ModbusRtuWorker(QThread):
             self.frame.emit(str(kind), bytes(data or b""), str(tag or ""), str(note or ""))
         except Exception:
             pass
+
+    def _pause_tx_output(self):
+        # Pause periodic TX/output sending (reference-counted).
+        with self._tx_pause_lock:
+            self._tx_pause_count += 1
+            self._tx_pause_event.set()
+
+    def _resume_tx_output(self):
+        # Resume periodic TX/output sending when pause count reaches zero.
+        with self._tx_pause_lock:
+            if self._tx_pause_count > 0:
+                self._tx_pause_count -= 1
+            if self._tx_pause_count <= 0:
+                self._tx_pause_count = 0
+                self._tx_pause_event.clear()
+
+    def _tx_output_paused(self) -> bool:
+        return self._tx_pause_event.is_set()
+
     def set_tx_tap_enabled(self, enabled: bool):
         """Enable/disable async RX tap for TX/output serial.
 
@@ -482,6 +522,9 @@ class ModbusRtuWorker(QThread):
     def _tx_writer_loop(self):
         """Write TX/output serial in a background thread (so it never blocks Modbus polling)."""
         while self._running:
+            if self._tx_output_paused():
+                time.sleep(0.01)
+                continue
             ser = self._tx_ser
             if ser is None:
                 time.sleep(0.05)
@@ -492,32 +535,37 @@ class ModbusRtuWorker(QThread):
                 continue
             if not payload:
                 continue
+            if self._tx_output_paused():
+                continue
             try:
-                # RS485 direction control (if user enabled)
-                if self.rs485_cfg.mode != Rs485CtrlMode.AUTO:
+                with self._tx_ser_lock:
+                    if self._tx_output_paused():
+                        continue
+                    # RS485 direction control (if user enabled)
+                    if self.rs485_cfg.mode != Rs485CtrlMode.AUTO:
+                        try:
+                            apply_rs485_tx_level(ser, self.rs485_cfg)
+                            if self.rs485_cfg.pre_tx_ms > 0:
+                                time.sleep(self.rs485_cfg.pre_tx_ms / 1000.0)
+                        except Exception:
+                            pass
+
+                    ser.write(payload)
+                    # do not flush aggressively (avoid blocking). virtual serial flush is no-op.
                     try:
-                        apply_rs485_tx_level(ser, self.rs485_cfg)
-                        if self.rs485_cfg.pre_tx_ms > 0:
-                            time.sleep(self.rs485_cfg.pre_tx_ms / 1000.0)
+                        ser.flush()
                     except Exception:
                         pass
 
-                ser.write(payload)
-                # do not flush aggressively (avoid blocking). virtual serial flush is no-op.
-                try:
-                    ser.flush()
-                except Exception:
-                    pass
+                    if self.rs485_cfg.mode != Rs485CtrlMode.AUTO:
+                        try:
+                            if self.rs485_cfg.post_tx_ms > 0:
+                                time.sleep(self.rs485_cfg.post_tx_ms / 1000.0)
+                            apply_rs485_rx_level(ser, self.rs485_cfg)
+                        except Exception:
+                            pass
 
-                if self.rs485_cfg.mode != Rs485CtrlMode.AUTO:
-                    try:
-                        if self.rs485_cfg.post_tx_ms > 0:
-                            time.sleep(self.rs485_cfg.post_tx_ms / 1000.0)
-                        apply_rs485_rx_level(ser, self.rs485_cfg)
-                    except Exception:
-                        pass
-
-                self._emit_frame('TX_TX', payload, tag=f'tx:{self.tx_port}')
+                    self._emit_frame('TX_TX', payload, tag=f'tx:{self.tx_port}')
             except Exception as e:
                 self._log(f'TX_OUT_ERR: {e}')
 
