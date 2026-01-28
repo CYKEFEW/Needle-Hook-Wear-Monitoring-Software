@@ -10,7 +10,8 @@ try:
         QLineEdit,
         QSpinBox, QDoubleSpinBox, QCheckBox, QHBoxLayout, QVBoxLayout,
         QGridLayout, QGroupBox, QTableWidget, QTableWidgetItem, QMessageBox,
-        QFileDialog, QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter, QSizePolicy
+        QFileDialog, QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter, QSizePolicy,
+        QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox
     )
 except Exception:
     QT_LIB = "PyQt5"
@@ -21,7 +22,8 @@ except Exception:
         QLineEdit,
         QSpinBox, QDoubleSpinBox, QCheckBox, QHBoxLayout, QVBoxLayout,
         QGridLayout, QGroupBox, QTableWidget, QTableWidgetItem, QMessageBox,
-        QFileDialog, QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter, QSizePolicy
+        QFileDialog, QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter, QSizePolicy,
+        QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox
     )
 
 __all__ = [
@@ -33,4 +35,5 @@ __all__ = [
     "QGridLayout", "QGroupBox", "QTableWidget", "QTableWidgetItem", "QMessageBox",
     "QFileDialog", "QHeaderView", "QDockWidget", "QTabWidget", "QTextEdit", "QPlainTextEdit",
     "QSplitter", "QSizePolicy",
+    "QDialog", "QListWidget", "QListWidgetItem", "QAbstractItemView", "QDialogButtonBox",
 ]

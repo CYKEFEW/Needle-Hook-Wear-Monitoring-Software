@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Main UI window for Modbus assistant."""
+"""Modbus 助手主界面窗口。"""
 
 import math
 import os
@@ -17,7 +17,7 @@ from serial.tools import list_ports
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-# Optional: numpy speeds up plotting at high rates
+# 可选：numpy 在高采样率下可加速绘图
 try:
     import numpy as np
 except Exception:  # pragma: no cover
@@ -29,7 +29,7 @@ from qt_compat import (
     QGroupBox, QTableWidget, QTableWidgetItem, QMessageBox, QFileDialog,
     QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter,
     QSizePolicy, QTimer, QSettings, QPoint, QTextCursor, QGuiApplication, QApplication,
-    Slot,
+    Slot, QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox,
 )
 
 from modbus_utils import ChannelConfig, DTYPE_INFO, hex_bytes
@@ -38,6 +38,91 @@ from virtual_serial import SIM_REGISTRY
 from worker import ModbusRtuWorker
 from sim_window import SerialSimManagerWindow
 from data_logger import DataLogger
+
+class HistoryDbDialog(QDialog):
+    def __init__(self, parent, data_dir: str, export_cb):
+        super().__init__(parent)
+        self._data_dir = data_dir
+        self._export_cb = export_cb
+        self.setWindowTitle("历史数据库")
+        self.resize(560, 420)
+
+        root = QVBoxLayout(self)
+        info = QLabel("选择历史数据库后导出为 XLSX")
+        root.addWidget(info)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        root.addWidget(self.list, 1)
+
+        btns = QDialogButtonBox()
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_export = QPushButton("导出")
+        self.btn_close = QPushButton("关闭")
+        btns.addButton(self.btn_refresh, QDialogButtonBox.ActionRole)
+        btns.addButton(self.btn_export, QDialogButtonBox.AcceptRole)
+        btns.addButton(self.btn_close, QDialogButtonBox.RejectRole)
+        root.addWidget(btns)
+
+        self.btn_refresh.clicked.connect(self.reload)
+        self.btn_export.clicked.connect(self.export_selected)
+        self.btn_close.clicked.connect(self.reject)
+        self.list.itemDoubleClicked.connect(lambda *_: self.export_selected())
+
+        self.reload()
+
+    def reload(self):
+        self.list.clear()
+        if not os.path.isdir(self._data_dir):
+            item = QListWidgetItem("(未找到 data_logs 目录)")
+            item.setFlags(Qt.NoItemFlags)
+            self.list.addItem(item)
+            return
+
+        db_files = []
+        try:
+            for name in os.listdir(self._data_dir):
+                if not name.lower().endswith((".sqlite", ".db")):
+                    continue
+                full = os.path.join(self._data_dir, name)
+                if os.path.isfile(full):
+                    try:
+                        mtime = os.path.getmtime(full)
+                    except Exception:
+                        mtime = 0.0
+                    db_files.append((mtime, full))
+        except Exception:
+            db_files = []
+
+        if not db_files:
+            item = QListWidgetItem("(无历史数据库)")
+            item.setFlags(Qt.NoItemFlags)
+            self.list.addItem(item)
+            return
+
+        db_files.sort(key=lambda x: x[0], reverse=True)
+        for mtime, full in db_files:
+            base = os.path.splitext(os.path.basename(full))[0]
+            try:
+                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(mtime)))
+            except Exception:
+                ts_str = "未知时间"
+            label = f"{ts_str}  |  {base}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, full)
+            self.list.addItem(item)
+
+    def export_selected(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        path = item.data(Qt.UserRole)
+        if not path:
+            return
+        try:
+            self._export_cb(path)
+        except Exception:
+            pass
 
 class MainWindow(QMainWindow):
 
@@ -58,15 +143,15 @@ class MainWindow(QMainWindow):
         self.channel_names: List[str] = []
         self.curves: Dict[str, pg.PlotDataItem] = {}
 
-        # ---- Plot ring buffer (size = 当前窗口最大点数) ----
+        # ---- 绘图环形缓冲区（大小 = 当前窗口最大点数） ----
         self._buf_size = 100
         self._buf_count = 0
-        self._buf_idx = 0  # next write index
-        self._ts_buf = None  # numpy array or list
-        self._ts_wall_buf = None  # wall-clock seconds (epoch)
-        self._val_buf_by_channel: Dict[str, object] = {}  # name -> np.ndarray or list
-        self._plot_x = None  # contiguous x for plotting (numpy)
-        self._plot_y_by_channel: Dict[str, object] = {}  # name -> np.ndarray or list
+        self._buf_idx = 0  # 下一次写入索引
+        self._ts_buf = None  # numpy 数组或列表
+        self._ts_wall_buf = None  # 墙钟时间秒（epoch）
+        self._val_buf_by_channel: Dict[str, object] = {}  # 名称 -> np.ndarray 或列表
+        self._plot_x = None  # 用于绘图的连续 x（numpy）
+        self._plot_y_by_channel: Dict[str, object] = {}  # 名称 -> np.ndarray 或列表
         self._fric_buf = None
         self._mu_buf = None
         self._fric_plot_y = None
@@ -74,12 +159,12 @@ class MainWindow(QMainWindow):
         self._plot_seq = 0
 
         self._last_plotted_seq = -1
-        # Smooth scrolling time base (relative seconds).
-        self._t0_mono_ts = None           # time.monotonic() at first sample
-        self._last_sample_rel_ts = None   # last sample relative seconds
-        self._last_sample_mono_ts = None  # time.monotonic() at last sample
+        # 平滑滚动的时间基准（相对秒）。
+        self._t0_mono_ts = None           # 首次采样时的 time.monotonic()
+        self._last_sample_rel_ts = None   # 上次采样的相对秒
+        self._last_sample_mono_ts = None  # 上次采样时的 time.monotonic()
 
-        # Pause-compensated monotonic timeline (so resume does not jump).
+        # 带暂停补偿的单调时间轴（恢复时不跳变）。
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
         self._settings = QSettings("ModbusAssistant", "ModbusAssistant")
@@ -98,7 +183,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Use a splitter so left/right sizes stay stable even when widgets change enabled/text states.
+        # 使用分割器，使左/右大小在控件启用状态或文本变化时保持稳定。
         self.main_splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(self.main_splitter, 1)
 
@@ -114,7 +199,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # ---- Serial group ----
+        # ---- 串口分组 ----
         serial_box = QGroupBox("串口配置")
         left.addWidget(serial_box)
         sg = QGridLayout(serial_box)
@@ -144,7 +229,7 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setSingleStep(0.05)
         self.timeout_spin.setValue(0.5)
 
-        # RS485 direction control
+        # RS485 方向控制
         self.rs485_mode_combo = QComboBox()
         self.rs485_mode_combo.addItems([Rs485CtrlMode.RTS, Rs485CtrlMode.DTR, Rs485CtrlMode.AUTO])
         self.rs485_mode_combo.setCurrentText(Rs485CtrlMode.RTS)  # 默认尝试用RTS解决TX不亮
@@ -159,7 +244,7 @@ class MainWindow(QMainWindow):
         self.post_tx_spin.setValue(2)
         self.post_tx_spin.setSuffix(" ms")
 
-        # Monitor enable for comm monitor (rx/tx)
+        # 通讯监视器启用（rx/tx）
         self.mon_rx_chk = QCheckBox("监听")
         self.mon_rx_chk.setChecked(False)
         self.mon_tx_chk = QCheckBox("监听")
@@ -215,7 +300,7 @@ class MainWindow(QMainWindow):
         sg.addWidget(QLabel("TX后延时"), 10, 0)
         sg.addWidget(self.post_tx_spin, 10, 1)
 
-        # Connect / Acquire buttons
+        # 连接/采集按钮
         btns = QHBoxLayout()
         self.connect_btn = QPushButton("连接串口")
         self.connect_btn.clicked.connect(lambda *_: self.toggle_connect())
@@ -233,7 +318,7 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.pause_btn)
         left.addLayout(btns)
 
-        # ---- Modbus group ----
+        # ---- Modbus 分组 ----
         modbus_box = QGroupBox("Modbus 配置")
         left.addWidget(modbus_box)
         mg = QGridLayout(modbus_box)
@@ -262,7 +347,7 @@ class MainWindow(QMainWindow):
         mg.addWidget(self.poll_spin, 2, 1)
         mg.addWidget(self.addr_base1_chk, 3, 0, 1, 2)
 
-        # ---- Plot group ----
+        # ---- 绘图分组 ----
         plot_box = QGroupBox("绘图设置")
         left.addWidget(plot_box)
         pgd = QGridLayout(plot_box)
@@ -274,7 +359,7 @@ class MainWindow(QMainWindow):
         self.autoscale_chk = QCheckBox("Y轴自动缩放")
         self.autoscale_chk.setChecked(True)
 
-        # plot update is throttled; mark dirty when settings change
+        # 绘图更新做限频；设置变化时标记为脏
         self.max_points_spin.valueChanged.connect(self._on_max_points_changed)
         self.autoscale_chk.toggled.connect(self._mark_plot_dirty)
 
@@ -298,7 +383,7 @@ class MainWindow(QMainWindow):
         pgd.addWidget(self.clear_btn, 3, 0)
         pgd.addWidget(self.save_btn, 3, 1)
 
-        # ---- Channel group ----
+        # ---- 通道分组 ----
         ch_box = QGroupBox("通道配置（多通道）")
         left.addWidget(ch_box, 1)
         cl = QVBoxLayout(ch_box)
@@ -323,15 +408,15 @@ class MainWindow(QMainWindow):
         btn_row.addStretch(1)
         cl.addLayout(btn_row)
 
-        # ---- Plot area ----
-        # Use a numeric time axis (seconds) for smooth scrolling.
-        # DateAxisItem snaps ticks to "nice" boundaries (often 1s), which can
-        # look like the x-axis only moves once per second.
+        # ---- 绘图区域 ----
+        # 使用数值时间轴（秒）以实现平滑滚动。
+        # DateAxisItem 会将刻度对齐到“整洁”边界（常为 1s），这会
+        # 看起来像是 x 轴每秒只移动一次。
         self.plot = pg.PlotWidget()
-        # ---- Plot performance options ----
-        # 1) Clip drawing to view to avoid rendering off-screen segments
-        # 2) Enable auto-downsampling (peak mode) when data is dense
-        # 3) Keep a renderer-side point budget as a safe fallback
+        # ---- 绘图性能选项 ----
+        # 1) 将绘制裁剪到视窗，避免渲染屏外线段
+        # 2) 数据密集时启用自动降采样（峰值模式）
+        # 3) 保留渲染端点数上限作为安全兜底
         try:
             pi = self.plot.getPlotItem()
             try:
@@ -339,7 +424,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                # Different pyqtgraph versions use "mode" or "method"
+                # 不同 pyqtgraph 版本使用的参数名是 “mode” 或 “method”
                 pi.setDownsampling(auto=True, mode="peak")
             except Exception:
                 try:
@@ -348,7 +433,7 @@ class MainWindow(QMainWindow):
                     pass
         except Exception:
             pass
-        # Fallback point budget sent to renderer per curve (0=disable)
+        # 每条曲线发送到渲染器的点数上限（0=禁用）
         self._max_display_points = 6000
 
         self.plot.setLabel("bottom", "时间", units="s")
@@ -356,7 +441,7 @@ class MainWindow(QMainWindow):
         self.plot.addLegend()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
 
-        # ---- Friction force plot ----
+        # ---- 摩擦力曲线 ----
         self.friction_plot = pg.PlotWidget()
         try:
             pi = self.friction_plot.getPlotItem()
@@ -379,7 +464,7 @@ class MainWindow(QMainWindow):
         self.friction_plot.showGrid(x=True, y=True, alpha=0.25)
         self.friction_curve = self.friction_plot.plot([], [], name="摩擦力", pen=pg.mkPen(color=(255, 140, 0), width=2))
 
-        # ---- Friction coefficient plot ----
+        # ---- 摩擦系数曲线 ----
         self.mu_plot = pg.PlotWidget()
         try:
             pi = self.mu_plot.getPlotItem()
@@ -402,7 +487,7 @@ class MainWindow(QMainWindow):
         self.mu_plot.showGrid(x=True, y=True, alpha=0.25)
         self.mu_curve = self.mu_plot.plot([], [], name="摩擦系数", pen=pg.mkPen(color=(0, 120, 220), width=2))
 
-        # ---- Plot window (dock) ----
+        # ---- 绘图窗口（停靠面板） ----
         self.plot_tabs = QTabWidget()
         tension_tab = QWidget()
         t_layout = QVBoxLayout(tension_tab)
@@ -482,7 +567,7 @@ class MainWindow(QMainWindow):
         self.mu_wrap_angle_spin.valueChanged.connect(self._on_mu_config_changed)
         self.mu_swap_btn.clicked.connect(self._swap_mu_channels)
 
-        # ---- Comm Monitor Dock ----
+        # ---- 通讯监视器停靠面板 ----
         self.monitor_dock = QDockWidget("通讯监视窗口", self)
         try:
             self.monitor_dock.setObjectName('dock_monitor')
@@ -500,7 +585,7 @@ class MainWindow(QMainWindow):
         mon_container = QWidget()
         mon_layout = QVBoxLayout(mon_container)
         mon_layout.setContentsMargins(6, 6, 6, 6)
-        # display mode
+        # 显示模式
         mon_mode_row = QHBoxLayout()
         mon_mode_row.addWidget(QLabel("显示模式"))
         self.monitor_mode_combo = QComboBox()
@@ -529,12 +614,12 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self.monitor_dock)
         self.monitor_dock.visibilityChanged.connect(lambda vis: vis and (self.schedule_monitor_render(full=True) or True))
 
-        # structured log storage for re-rendering in HEX/TEXT modes
+        # 结构化日志缓存，用于 HEX/TEXT 模式重绘
         self._monitor_entries: List[dict] = []
         self._manual_entries: List[dict] = []
         self._motor_mon_entries: List[dict] = []
 
-        # ---- UI throttle timers (avoid stutter at high frame rates) ----
+        # ---- UI 限频计时器（高帧率下避免卡顿） ----
         self._monitor_dirty = False
         self._manual_dirty = False
         self._monitor_timer = QTimer(self)
@@ -553,18 +638,18 @@ class MainWindow(QMainWindow):
         self._motor_mon_timer.setSingleShot(True)
         self._motor_mon_timer.timeout.connect(self._flush_motor_monitor_render)
 
-        # ---- Plot throttle (refresh-rate driven) ----
+        # ---- 绘图限频（由刷新率驱动） ----
         self._plot_dirty = False
         self._plot_timer = QTimer(self)
-        self._plot_timer.setInterval(16)  # will be updated by _on_plot_fps_changed()
+        self._plot_timer.setInterval(16)  # 将由 _on_plot_fps_changed() 更新
         self._plot_timer.timeout.connect(self._flush_plot)
-        # NOTE: plot timer starts only while acquiring (see _update_plot_timer_running)
+        # 注意：绘图计时器仅在采集中启动（见 _update_plot_timer_running）
         self._on_plot_fps_changed()
 
         self._last_xrange_update = 0.0
         self._last_yrange_update = 0.0
 
-        # ---- Custom Send Dock (default hidden, show on right) ----
+        # ---- 自定义发送停靠面板（默认隐藏，显示在右侧） ----
         self.custom_send_dock = QDockWidget("自定义串口发送", self)
         try:
             self.custom_send_dock.setObjectName('dock_custom_send')
@@ -590,7 +675,7 @@ class MainWindow(QMainWindow):
         send_grid.addWidget(self.custom_send_line, 1, 1)
         send_layout.addLayout(send_grid)
 
-        # display mode
+        # 显示模式
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("日志显示"))
         self.custom_send_mode_combo = QComboBox()
@@ -613,7 +698,7 @@ class MainWindow(QMainWindow):
         tip.setWordWrap(True)
         send_layout.addWidget(tip)
 
-        # reply/listen area (filtered manual TX/RX for the selected opened port)
+        # 回显/监听区域（过滤所选已打开端口的手动 TX/RX）
         send_layout.addWidget(QLabel("回复 / 日志"))
         self.custom_send_log = QPlainTextEdit()
         self.custom_send_log.setReadOnly(True)
@@ -636,9 +721,9 @@ class MainWindow(QMainWindow):
 
         self.custom_send_dock.setWidget(send_container)
         self.addDockWidget(Qt.RightDockWidgetArea, self.custom_send_dock)
-        self.custom_send_dock.hide()  # default closed
+        self.custom_send_dock.hide()  # 默认关闭
 
-        # ---- Motor Control Dock (default hidden) ----
+        # ---- 电机控制停靠面板（默认隐藏） ----
         self.motor_dock = QDockWidget("电机控制", self)
         try:
             self.motor_dock.setObjectName('dock_motor')
@@ -650,7 +735,7 @@ class MainWindow(QMainWindow):
         motor_layout = QVBoxLayout(motor_container)
         motor_layout.setContentsMargins(8, 8, 8, 8)
 
-        # Enable/Disable
+        # 启用/禁用
         en_row = QHBoxLayout()
         self.motor_enable_btn = QPushButton("使能")
         self.motor_disable_btn = QPushButton("去使能")
@@ -664,7 +749,7 @@ class MainWindow(QMainWindow):
         en_row.addStretch(1)
         motor_layout.addLayout(en_row)
 
-        # Direction
+        # 方向
         dir_row = QHBoxLayout()
         self.motor_forward_btn = QPushButton("正转")
         self.motor_backward_btn = QPushButton("反转")
@@ -677,7 +762,7 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.motor_dir_lamp)
         dir_row.addStretch(1)
         motor_layout.addLayout(dir_row)
-        # Mode selection
+        # 模式选择
         mode_row = QHBoxLayout()
         self.motor_mode_tension_btn = QPushButton("张力模式")
         self.motor_mode_speed_btn = QPushButton("速度模式")
@@ -696,7 +781,7 @@ class MainWindow(QMainWindow):
         mode_row.addStretch(1)
         motor_layout.addLayout(mode_row)
 
-        # Speed control
+        # 速度控制
         speed_row = QHBoxLayout()
         speed_row.addWidget(QLabel("转速(RPM)"))
         self.motor_speed_edit = QLineEdit()
@@ -706,7 +791,7 @@ class MainWindow(QMainWindow):
         speed_row.addWidget(self.motor_speed_btn)
         motor_layout.addLayout(speed_row)
 
-        # Tension control
+        # 张力控制
         tension_row = QHBoxLayout()
         tension_row.addWidget(QLabel("张力(N)"))
         self.motor_tension_edit = QLineEdit()
@@ -716,7 +801,7 @@ class MainWindow(QMainWindow):
         tension_row.addWidget(self.motor_tension_btn)
         motor_layout.addLayout(tension_row)
 
-        # PID control
+        # PID 控制
         pid_row = QHBoxLayout()
         pid_row.addWidget(QLabel("Kp"))
         self.motor_kp_edit = QLineEdit()
@@ -734,7 +819,7 @@ class MainWindow(QMainWindow):
         pid_row.addWidget(self.motor_pid_btn)
         motor_layout.addLayout(pid_row)
 
-        # Emergency stop
+        # 急停
         self.motor_estop_btn = QPushButton("急停")
         try:
             self.motor_estop_btn.setStyleSheet("background:#d9534f;color:white;font-weight:bold;")
@@ -750,7 +835,7 @@ class MainWindow(QMainWindow):
         estop_row.addStretch(1)
         motor_layout.addLayout(estop_row)
 
-        # TX monitor for motor control
+        # 电机控制的 TX 监视
         motor_mon_group = QGroupBox("发送串口监视")
         motor_mon_layout = QVBoxLayout(motor_mon_group)
         motor_mon_layout.setContentsMargins(6, 6, 6, 6)
@@ -782,7 +867,7 @@ class MainWindow(QMainWindow):
 
         self.motor_dock.setWidget(motor_container)
         self.addDockWidget(Qt.RightDockWidgetArea, self.motor_dock)
-        self.motor_dock.hide()  # default hidden
+        self.motor_dock.hide()  # 默认隐藏
         self.motor_dock.visibilityChanged.connect(lambda vis: vis and (self.schedule_motor_monitor_render(full=True) or True))
 
         self.motor_enable_btn.clicked.connect(lambda *_: self.on_motor_enable())
@@ -802,7 +887,7 @@ class MainWindow(QMainWindow):
         self.custom_send_dock.visibilityChanged.connect(lambda vis: vis and (self.update_custom_send_ports() or True) and (self.schedule_custom_send_render(full=True) or True))
         self.custom_send_port_combo.currentIndexChanged.connect(lambda *_: self.schedule_custom_send_render(full=True))
 
-        # ---- Workspace menu (show/hide panels) ----
+        # ---- 工作区菜单（显示/隐藏面板） ----
         ws_menu = self.menuBar().addMenu("工作区")
 
         act_serial = ws_menu.addAction("串口配置")
@@ -826,21 +911,21 @@ class MainWindow(QMainWindow):
         act_channels.toggled.connect(ch_box.setVisible)
 
         ws_menu.addSeparator()
-        # Dock 自带的切换 Action
+        # 停靠面板自带的切换动作
         ws_menu.addAction(self.monitor_dock.toggleViewAction())
         ws_menu.addAction(self.custom_send_dock.toggleViewAction())
 
-        # Monitor enable switches
+        # 监视器启用开关
         self.mon_rx_chk.toggled.connect(self.schedule_monitor_render)
         self.mon_tx_chk.toggled.connect(self.on_tx_monitor_toggled)
 
-        # ---- Control menu ----
+        # ---- 控制菜单 ----
         ctrl_menu = self.menuBar().addMenu("控制")
         act_motor = ctrl_menu.addAction("电机控制")
         act_motor.triggered.connect(self.open_motor_control)
 
 
-        # ---- Plot window menu ----
+        # ---- 绘图窗口菜单 ----
         plot_menu = self.menuBar().addMenu("绘图窗口")
         self.act_plot_window = plot_menu.addAction("显示绘图窗口")
         self.act_plot_window.setCheckable(True)
@@ -858,7 +943,11 @@ class MainWindow(QMainWindow):
         self.act_mu_plot.setChecked(False)
         self.act_mu_plot.toggled.connect(lambda on: self._set_plot_tab_visible(self.mu_tab, "摩擦系数", on))
 
-        # ---- Serial simulator menu ----
+        # ---- 历史数据菜单 ----
+        self.hist_menu = self.menuBar().addMenu("历史数据")
+        self._build_history_menu()
+
+        # ---- 串口模拟器菜单 ----
         sim_menu = self.menuBar().addMenu('串口仿真')
         act_sim = sim_menu.addAction('打开仿真串口界面')
         self.sim_manager = SerialSimManagerWindow(self)
@@ -867,18 +956,18 @@ class MainWindow(QMainWindow):
         self.sim_manager.ports_changed.connect(self.refresh_ports)
 
 
-        # Init
+        # 初始化
         self.refresh_ports()
         # 默认两通道：两个 int16（01 03 00 00 00 02 ...）
         self.add_channel_row(default_name="CH1", default_addr=0, default_dtype="int16")
         self.add_channel_row(default_name="CH2", default_addr=1, default_dtype="int16")
         self._refresh_friction_channel_options()
 
-        # Keep layout stable (no left-panel width jitter) and restore last workspace state.
+        # 保持布局稳定（左侧面板宽度不抖动）并恢复上次工作区状态。
         self._apply_stable_widget_sizing()
 
-        # Restore last workspace state only after the window is actually shown.
-        # Doing it too early (during __init__) may lead to incomplete first layout on some systems.
+        # 仅在窗口真正显示后恢复上次工作区状态。
+        # 过早执行（在 __init__ 期间）可能导致部分系统首帧布局不完整。
         self._restored_once = False
 
     def showEvent(self, e):
@@ -890,20 +979,20 @@ class MainWindow(QMainWindow):
     def _restore_after_show(self):
         self._restore_window_layout()
 
-        # Fix: saved window position may be partially off-screen (negative Y, etc.)
+        # 修复：保存的窗口位置可能部分在屏幕外（负 Y 等）
         self._ensure_frame_on_screen()
         QTimer.singleShot(50, self._ensure_frame_on_screen)
         QTimer.singleShot(180, self._ensure_frame_on_screen)
 
-        # Force a couple of layout/paint passes.
-        # On some systems (Windows + high DPI, and/or OpenGL-backed widgets), the very first
-        # frame may not fully lay out/paint until a resizeEvent happens (e.g. user drags border).
-        # We emulate that once, without changing the visible size.
+        # 强制进行几次布局/绘制。
+        # 在某些系统（Windows + 高 DPI，或基于 OpenGL 的控件）上，第一帧
+        # 在发生 resizeEvent（如用户拖动边框）之前可能不会完全布局/绘制。
+        # 我们在不改变可见尺寸的情况下模拟一次。
         self._force_first_layout_pass()
         QTimer.singleShot(0, self._force_first_layout_pass)
 
     def _force_first_layout_pass(self):
-        # Activate central layout
+        # 激活中央布局
         try:
             cw = self.centralWidget()
             if cw:
@@ -916,16 +1005,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Stabilize splitter geometry
+        # 稳定分割器几何
         try:
             if hasattr(self, "main_splitter") and self.main_splitter is not None:
                 try:
                     self.main_splitter.updateGeometry()
                 except Exception:
                     pass
-                # Re-apply current sizes to force internal recompute
+                # 重新应用当前尺寸以强制内部重新计算
                 self.main_splitter.setSizes(self.main_splitter.sizes())
-                # Guard against a bad restored splitter state (e.g. one side nearly collapsed).
+                # 防止恢复出错的分割器状态（如一侧几乎收缩）。
                 try:
                     sizes = self.main_splitter.sizes()
                     if isinstance(sizes, (list, tuple)) and len(sizes) >= 2:
@@ -940,13 +1029,13 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Flush pending events once (first-show only)
+        # 刷新一次待处理事件（仅首次显示）
         try:
             QApplication.processEvents()
         except Exception:
             pass
 
-        # Nudge window size (triggers resizeEvent like a manual border drag)
+        # 微调窗口尺寸（触发类似手动拖边的 resizeEvent）
         try:
             is_max = getattr(self, "isMaximized", lambda: False)()
             is_full = getattr(self, "isFullScreen", lambda: False)()
@@ -957,7 +1046,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Help plotting widget settle (pyqtgraph / OpenGL)
+        # 让绘图控件稳定下来（pyqtgraph / OpenGL）
         try:
             if hasattr(self, "plot") and self.plot is not None:
                 try:
@@ -979,19 +1068,18 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Ensure the restored window frame is fully visible on the current screen
-        # (fixes cases where QSettings restored a negative Y, etc.)
+        # 确保恢复的窗口框架在当前屏幕完全可见
+        # （修复 QSettings 恢复出负 Y 等情况）
         self._ensure_frame_on_screen()
 
     def _ensure_frame_on_screen(self):
-        """Keep the window frame inside the current screen's available area.
+        """确保窗口框架在当前屏幕可用区域内。
 
-        This fixes cases where a previously saved QSettings window position is restored with
-        a negative Y (top clipped) or otherwise partially off-screen. We clamp using the
-        *frameGeometry* (including title bar) rather than the client geometry.
+        这用于修复 QSettings 恢复的窗口位置出现负 Y（顶部被裁剪）或部分在屏幕外的情况。
+        我们使用 *frameGeometry*（含标题栏）而不是客户端区域进行限制。
         """
         try:
-            # Don't interfere with maximized/fullscreen states
+            # 不干预最大化/全屏状态
             try:
                 if getattr(self, "isMaximized", lambda: False)() or getattr(self, "isFullScreen", lambda: False)():
                     return
@@ -1017,14 +1105,14 @@ class MainWindow(QMainWindow):
             x, y = int(fg.x()), int(fg.y())
             w, h = int(fg.width()), int(fg.height())
 
-            # If it's totally outside, re-center
+            # 如果完全在屏幕外，则重新居中
             if (x + w) < (avail.left() + 20) or x > (avail.left() + avail.width() - 20) or (y + h) < (avail.top() + 20) or y > (avail.top() + avail.height() - 20):
                 new_x = int(avail.left() + max(0, (avail.width() - w) // 2))
                 new_y = int(avail.top() + max(0, (avail.height() - h) // 2))
                 self.move(new_x, new_y)
                 return
 
-            # Clamp into available rect
+            # 限制到可用区域
             max_x = int(avail.left() + max(0, avail.width() - w))
             max_y = int(avail.top() + max(0, avail.height() - h))
             new_x = min(max(x, int(avail.left())), max_x)
@@ -1058,9 +1146,9 @@ class MainWindow(QMainWindow):
             pass
 
     def _apply_stable_widget_sizing(self):
-        """Prevent left-panel width jitter caused by long/short combo texts.
+        """防止下拉框文本长短变化导致左侧面板宽度抖动。
 
-        This keeps the current workspace layout stable when clicking connect/refresh/etc.
+        这用于在点击连接/刷新等操作时保持当前工作区布局稳定。
         """
         combos = [
             getattr(self, 'port_combo', None),
@@ -1070,7 +1158,7 @@ class MainWindow(QMainWindow):
         for cb in combos:
             if cb is None:
                 continue
-            # Prefer policy that does NOT resize to current text.
+            # 优先使用不会随当前文本改变尺寸的策略。
             pol = None
             try:
                 pol = QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -1098,19 +1186,19 @@ class MainWindow(QMainWindow):
             pass
 
     def _apply_safe_geometry(self, x, y, w, h):
-        """Clamp geometry to current screen's available area.
+        """将几何尺寸限制到当前屏幕可用区域。
 
-        This avoids Qt warnings like:
+        这用于避免 Qt 警告，例如：
         QWindowsWindow::setGeometry: Unable to set geometry ...
-        when restoring a window size larger than the current available screen
-        area (taskbar, DPI scaling, monitor change, etc.).
+        当恢复的窗口尺寸超过当前可用屏幕区域
+        （任务栏、DPI 缩放、显示器变化等）时会出现该问题。
         """
         try:
             x = int(x); y = int(y); w = int(w); h = int(h)
         except Exception:
             return
 
-        # If maximized/fullscreen, don't fight window manager.
+        # 若最大化/全屏，不与窗口管理器对抗。
         try:
             if getattr(self, 'isMaximized', lambda: False)() or getattr(self, 'isFullScreen', lambda: False)():
                 return
@@ -1169,7 +1257,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _ensure_window_on_screen(self):
-        """Clamp current window geometry to be visible on some screen."""
+        """限制当前窗口几何，使其在某个屏幕可见。"""
         try:
             if getattr(self, 'isMaximized', lambda: False)() or getattr(self, 'isFullScreen', lambda: False)():
                 return
@@ -1212,7 +1300,7 @@ class MainWindow(QMainWindow):
         except Exception:
             had_split = False
 
-        # --- Restore main window rect (preferred) ---
+        # --- 恢复主窗口矩形（优先） ---
         rect = None
         try:
             rect = s.value('main/rect')
@@ -1225,17 +1313,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         else:
-            # Backward-compat: fall back to Qt's saveGeometry/restoreGeometry
+            # 兼容旧版本：回退到 Qt 的 saveGeometry/restoreGeometry
             try:
                 geom = s.value('main/geometry')
                 if geom:
                     self.restoreGeometry(geom)
             except Exception:
                 pass
-            # Clamp in case the restored geometry doesn't fit current screen/DPI
+            # 限制以防恢复的几何尺寸不适配当前屏幕/DPI
             self._ensure_window_on_screen()
 
-        # --- Restore docks/tool state ---
+        # --- 恢复停靠面板/工具状态 ---
         try:
             state = s.value('main/state')
             if state:
@@ -1243,7 +1331,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # --- Restore splitter sizes ---
+        # --- 恢复分割器尺寸 ---
         try:
             sp = s.value('main/splitter')
             if sp and hasattr(self, 'main_splitter'):
@@ -1251,7 +1339,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Restore window maximized state (after geometry)
+        # 恢复窗口最大化状态（在几何恢复之后）
         try:
             ws = s.value('main/wstate')
             ws_i = int(ws) if ws is not None else 0
@@ -1260,10 +1348,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Clamp again after restoreState (dock/min-size may change)
+        # 在 restoreState 之后再次限制（停靠/最小尺寸可能变化）
         self._ensure_window_on_screen()
 
-        # First run fallback: give the left panel a reasonable width.
+        # 首次运行兜底：给左侧面板一个合理宽度。
         if not had_split:
             try:
                 if hasattr(self, 'main_splitter'):
@@ -1278,11 +1366,11 @@ class MainWindow(QMainWindow):
                 pass
 
 
-    # ---------- UI throttling helpers ----------
+    # ---------- UI 限频辅助 ----------
     def schedule_monitor_render(self, full: bool = False):
-        """Throttle comm-monitor UI updates.
+        """限制通讯监视器 UI 更新频率。
 
-        full=True forces a full re-render (e.g. display mode changed / panel shown).
+        full=True 强制全量重绘（如显示模式改变/面板显示）。
         """
         if full:
             setattr(self, "_monitor_force_full", True)
@@ -1316,7 +1404,7 @@ class MainWindow(QMainWindow):
     def _flush_monitor_render(self):
         if not getattr(self, "_monitor_dirty", False):
             return
-        # if panel hidden, defer render to when it becomes visible
+        # 面板隐藏时，延迟到可见时再渲染
         if hasattr(self, "monitor_dock") and not self.monitor_dock.isVisible():
             self._monitor_dirty = False
             self._monitor_force_full = True
@@ -1451,7 +1539,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Restore selection if possible
+        # 如可能则恢复选择
         try:
             if cur_high and cur_high in names:
                 self.fric_high_combo.setCurrentText(cur_high)
@@ -1650,7 +1738,7 @@ class MainWindow(QMainWindow):
         if size <= 0:
             return
 
-        # X range sync
+        # X 轴范围同步
         if scroll_live:
             try:
                 self.friction_plot.setXRange(x_left, x_right, padding=0.0)
@@ -1719,7 +1807,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Autoscale handling for derived plots
+        # 派生曲线的自动缩放处理
         try:
             auto = bool(self.autoscale_chk.isChecked()) if hasattr(self, "autoscale_chk") else True
         except Exception:
@@ -1730,14 +1818,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
     def _flush_plot(self):
-        # Plot refresh is driven by timer (Hz). We always call update_plot(),
-        # which will only re-upload curve data when new samples arrive, but
-        # will keep X scrolling smoothly at the requested refresh rate.
+        # 绘图刷新由计时器（Hz）驱动，我们始终调用 update_plot()，
+        # 它仅在有新采样时才重新上传曲线数据，但
+        # 会在指定刷新率下保持 X 平滑滚动。
         self.update_plot()
 
 
     def _on_plot_fps_changed(self, *args):
-        """Apply plot refresh rate (Hz) to the plot timer."""
+        """将绘图刷新率（Hz）应用到绘图计时器。"""
         try:
             hz = int(self.plot_fps_spin.value()) if hasattr(self, 'plot_fps_spin') else 60
         except Exception:
@@ -1749,14 +1837,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # apply start/stop based on current state
+        # 根据当前状态应用启停
         try:
             self._update_plot_timer_running()
         except Exception:
             pass
 
     def _update_plot_timer_running(self):
-        """Start/stop plot timer based on acquisition state (save CPU, freeze scrolling)."""
+        """根据采集状态启动/停止绘图计时器（节省 CPU，冻结滚动）。"""
         try:
             live = bool(getattr(self, "is_acquiring", False)) and (not bool(getattr(self, "is_paused", False)))
         except Exception:
@@ -1777,7 +1865,7 @@ class MainWindow(QMainWindow):
 
 
     def _on_max_points_changed(self, *args):
-        """Resize ring buffers when max points changes."""
+        """最大点数变化时调整环形缓冲区大小。"""
         try:
             new_size = int(self.max_points_spin.value())
         except Exception:
@@ -1794,9 +1882,9 @@ class MainWindow(QMainWindow):
         self._alloc_ring_buffers(new_size, list(self.channel_names), keep_last=True, xs=xs, ys_map=ys_map, xs_wall=xs_wall)
 
     def _alloc_ring_buffers(self, size: int, channel_names: list, keep_last: bool = False, xs=None, ys_map=None, xs_wall=None):
-        """Allocate ring buffers.
+        """分配环形缓冲区。
 
-        When keep_last=True, copies the last min(len(xs), size) samples into the new buffer.
+        当 keep_last=True 时，将最后 min(len(xs), size) 个样本复制到新缓冲区。
         """
         size = int(max(10, size))
         self._buf_size = size
@@ -1867,7 +1955,7 @@ class MainWindow(QMainWindow):
                     else:
                         self._val_buf_by_channel[name][:k] = list(tail_y)
 
-                # recompute friction buffers for preserved samples
+                # 对保留样本重新计算摩擦相关缓冲
                 high_name = (getattr(self, "_fric_high_name", "") or "").strip()
                 low_name = (getattr(self, "_fric_low_name", "") or "").strip()
                 if high_name and low_name:
@@ -1900,7 +1988,7 @@ class MainWindow(QMainWindow):
                 self._buf_idx = k % size
 
     def _snapshot_ring(self, include_wall: bool = False):
-        """Snapshot ring buffer into time-ordered python lists (for resize/export)."""
+        """将环形缓冲区快照为按时间排序的 Python 列表（用于调整大小/导出）。"""
         count = int(getattr(self, '_buf_count', 0) or 0)
         size = int(getattr(self, '_buf_size', 0) or 0)
         if count <= 0 or size <= 0 or self._ts_buf is None:
@@ -1910,13 +1998,13 @@ class MainWindow(QMainWindow):
         idx = int(getattr(self, '_buf_idx', 0) or 0)
 
         if count < size:
-            # not wrapped
+            # 未环绕
             if np is not None:
                 xs = [float(x) for x in self._ts_buf[:count]]
             else:
                 xs = list(self._ts_buf[:count])
         else:
-            # wrapped: oldest at idx
+            # 已环绕：最旧数据在 idx 处
             if np is not None:
                 xs = [float(x) for x in self._ts_buf[idx:]] + [float(x) for x in self._ts_buf[:idx]]
             else:
@@ -1962,17 +2050,17 @@ class MainWindow(QMainWindow):
             return xs, ys_map, xs_wall
         return xs, ys_map
 
-    # ---------- monitor ----------
+    # ---------- 监视 ----------
     def append_monitor(self, s: str):
-        """Append a plain text info line (non-frame).
+        """追加一行纯文本信息（非帧）。
 
-        NOTE: UI rendering is throttled to avoid stutter at high frame rates.
+        注意：为避免高帧率卡顿，UI 渲染会限频。
         """
         self._monitor_entries.append({"kind": "INFO", "data": b"", "tag": "", "note": str(s)})
         self.schedule_monitor_render()
 
     def _custom_send_current_tag(self) -> str:
-        """Return the current filter tag (e.g. 'rx:COM3' / 'tx:COM4') for custom-send dock."""
+        """返回自定义发送面板的当前过滤标签（如 'rx:COM3' / 'tx:COM4'）。"""
         if not self.is_connected or self.worker is None:
             return ""
         if not hasattr(self, "custom_send_port_combo"):
@@ -1986,7 +2074,7 @@ class MainWindow(QMainWindow):
             return f"tx:{p}" if p else ""
         return ""
     def on_tx_monitor_toggled(self, checked: bool):
-        """Enable/disable TX port async RX monitoring tap.
+        """启用/禁用 TX 端口异步 RX 监听钩子。
 
         仅影响通讯监视窗口对发送串口的 RX 监听（窥探式读取）。
         """
@@ -2040,7 +2128,7 @@ class MainWindow(QMainWindow):
             if note:
                 return f"{prefix}: {payload}  {note}"
             return f"{prefix}: {payload}"
-        # no data
+        # 无数据
         return f"{prefix}: {note}" if prefix else str(note)
 
     def render_monitor(self, force_full: bool = False):
@@ -2048,11 +2136,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "monitor_mode_combo"):
             mode = self.monitor_mode_combo.currentData() or "hex"
 
-        # Track mode/index for delta-append rendering
+        # 记录模式/索引用于增量追加渲染
         last_mode = getattr(self, "_monitor_render_mode", None)
         render_idx = int(getattr(self, "_monitor_render_idx", 0) or 0)
 
-        # If mode changed or forced, rebuild last N lines (rare path)
+        # 若模式变更或强制刷新，则重建最近 N 行（少见路径）
         if force_full or last_mode != mode or render_idx <= 0:
             max_lines = 2000
             entries = self._monitor_entries[-max_lines:]
@@ -2067,10 +2155,10 @@ class MainWindow(QMainWindow):
             self._monitor_render_idx = len(self._monitor_entries)
             return
 
-        # Delta append new lines
+        # 增量追加新行
         if render_idx < len(self._monitor_entries):
             new_entries = self._monitor_entries[render_idx:]
-            # Batch append to reduce UI updates
+            # 批量追加以减少 UI 更新
             lines = [self._format_entry(e, mode) for e in new_entries]
             if lines:
                 try:
@@ -2166,14 +2254,14 @@ class MainWindow(QMainWindow):
     def on_frame(self, kind: str, data: bytes, tag: str, note: str):
         e = {"kind": str(kind), "data": bytes(data or b""), "tag": str(tag or ""), "note": str(note or "")}
 
-        # Always keep manual TX/RX entries for the custom-send dock
+        # 为自定义发送面板始终保留手动 TX/RX 记录
         is_manual = str(kind).startswith('TX_MANUAL') or str(kind).startswith('RX_MANUAL')
         if is_manual:
             self._manual_entries.append(e)
             if self.custom_send_dock.isVisible():
                 self.schedule_custom_send_render()
 
-            # cap memory for logs
+            # 限制日志内存占用
             if len(self._manual_entries) > 6000:
                 overflow = len(self._manual_entries) - 6000
                 del self._manual_entries[:overflow]
@@ -2182,7 +2270,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     self._manual_render_idx = 0
 
-        # Comm monitor filtering per-port (rx/tx listen checkboxes)
+        # 通讯监视器按端口过滤（rx/tx 监听复选框）
         t = e.get('tag', '') or ''
         allow = True
         if t.startswith('rx:') and hasattr(self, 'mon_rx_chk'):
@@ -2204,7 +2292,7 @@ class MainWindow(QMainWindow):
 
 
 
-        # Motor TX monitor: only RX frames from tx port
+        # 电机 TX 监视：仅显示 tx 端口的 RX 帧
         t2 = e.get("tag", "") or ""
         k2 = str(kind)
         if t2.startswith("tx:") and k2.startswith("RX"):
@@ -2230,14 +2318,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存通讯日志失败：\n{e}")
 
-    # ---------- status ----------
+    # ---------- 状态 ----------
     def set_status(self, msg: str):
         self.status_label.setText(f"状态：{msg}")
 
-    # ---------- ports ----------
+    # ---------- 端口 ----------
     def refresh_ports(self):
-        """Refresh physical COM ports + in-app simulated ports."""
-        # Preserve current selections to avoid UI jump.
+        """刷新物理 COM 端口和应用内模拟端口。"""
+        # 保留当前选择，避免 UI 跳动。
         cur_rx = self.port_combo.currentData()
         cur_tx = self.tx_port_combo.currentData()
 
@@ -2246,7 +2334,7 @@ class MainWindow(QMainWindow):
 
         items = []
 
-        # Physical ports
+        # 物理端口
         try:
             ports = list(list_ports.comports())
         except Exception:
@@ -2265,7 +2353,7 @@ class MainWindow(QMainWindow):
                 label += f"  —  {hwid}"
             items.append((label, p.device))
 
-        # Simulated ports
+        # 模拟端口
         for info in SIM_REGISTRY.list_infos():
             label = f"{info.com}  —  仿真串口"
             items.append((label, info.key))
@@ -2277,7 +2365,7 @@ class MainWindow(QMainWindow):
             for label, key in items:
                 self.port_combo.addItem(label, key)
                 self.tx_port_combo.addItem(label, key)
-        # Restore selections if possible
+        # 如可能则恢复选择
         try:
             if cur_rx:
                 idx = self.port_combo.findData(cur_rx)
@@ -2290,10 +2378,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # keep custom-send dock port list in sync
+        # 保持自定义发送面板端口列表同步
         self.update_custom_send_ports()
     def update_custom_send_ports(self):
-        """Only show ports that are already opened by this program."""
+        """只显示本程序已打开的端口。"""
         if not hasattr(self, "custom_send_port_combo"):
             return
 
@@ -2303,12 +2391,12 @@ class MainWindow(QMainWindow):
 
         items = []
         if self.is_connected and self.worker is not None:
-            # rx/modbus port is always connected when worker emits connected(True)
+            # 当 worker 发出 connected(True) 时，rx/modbus 端口总是已连接
             rx_port = getattr(self.worker, "port", "")
             if rx_port:
                 items.append((f"接收串口(Modbus)：{rx_port}", "rx"))
 
-            # tx/output port may be enabled
+            # tx/输出端口可能被启用
             if getattr(self.worker, "tx_enabled", False) and getattr(self.worker, "_tx_ser", None) is not None:
                 tx_port = getattr(self.worker, "tx_port", "")
                 if tx_port and tx_port != rx_port:
@@ -2348,10 +2436,10 @@ class MainWindow(QMainWindow):
 
         add_crlf = bool(self.custom_send_crlf_chk.isChecked())
         self.worker.enqueue_custom_send(str(target), text, add_crlf)
-        # don't clear input (方便连续修改/重复发送)
+        # 不清空输入（方便连续修改/重复发送）
         self.custom_send_line.setFocus()
 
-    # ---------- motor control ----------
+    # ---------- 电机控制 ----------
     def _set_lamp_color(self, label: QLabel, color: str):
         if label is None:
             return
@@ -2472,8 +2560,8 @@ class MainWindow(QMainWindow):
     def on_motor_estop(self):
         if not self._motor_can_send():
             return
-        # Order: set mode -> tension -> set mode -> speed -> disable
-        # Ensure mode is set before issuing F/Con commands.
+        # 顺序：设置模式 -> 张力 -> 设置模式 -> 速度 -> 禁用
+        # 在发送 F/Con 命令前确保模式已设置。
         self._send_motor_cmd("ConMode 0")
         self._send_motor_cmd("F 0")
         self._send_motor_cmd("ConMode 1")
@@ -2493,7 +2581,7 @@ class MainWindow(QMainWindow):
         ]:
             w.setEnabled(enabled)
 
-    # ---------- channel table ----------
+    # ---------- 通道表格 ----------
     def add_channel_row(self, default_name: str = "", default_addr: int = 0, default_dtype: str = "float32"):
         row = self.ch_table.rowCount()
         self.ch_table.insertRow(row)
@@ -2577,9 +2665,9 @@ class MainWindow(QMainWindow):
         return channels
 
 
-    # ---------- plot/data ----------
+    # ---------- 绘图/数据 ----------
     def clear_data(self):
-        # reset ring buffers (size follows current max-points)
+        # 重置环形缓冲区（大小跟随当前最大点数）
         try:
             size = int(self.max_points_spin.value())
         except Exception:
@@ -2588,12 +2676,12 @@ class MainWindow(QMainWindow):
         self.channel_names.clear()
         self._alloc_ring_buffers(size, [], keep_last=False)
 
-        # reset plot time base (relative seconds)
+        # 重置绘图时间基准（相对秒）
         self._t0_mono_ts = None
         self._last_sample_rel_ts = None
         self._last_sample_mono_ts = None
 
-        # reset pause-compensation
+        # 重置暂停补偿
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
 
@@ -2616,13 +2704,13 @@ class MainWindow(QMainWindow):
 
         # 1-7 通道配色：红 橙 黄 绿 青 蓝 紫（更高区分度）
         palette = [
-            (220, 0, 0),      # red
-            (255, 140, 0),    # orange
-            (255, 200, 0),    # yellow (slightly darker on white)
-            (0, 170, 0),      # green
-            (0, 170, 170),    # cyan
-            (0, 0, 220),      # blue
-            (140, 0, 200),    # purple
+            (220, 0, 0),      # 红
+            (255, 140, 0),    # 橙
+            (255, 200, 0),    # 黄（白底下略深）
+            (0, 170, 0),      # 绿
+            (0, 170, 170),    # 青
+            (0, 0, 220),      # 蓝
+            (140, 0, 200),    # 紫
         ]
         width = 2  # 线宽稍微粗一点
 
@@ -2632,7 +2720,7 @@ class MainWindow(QMainWindow):
             self.curves[name] = self.plot.plot([], [], name=name, pen=pen)
             item = self.curves.get(name)
             if item is not None:
-                # Per-curve performance hints (safe across versions)
+                # 每条曲线的性能提示（跨版本安全）
                 try:
                     item.setClipToView(True)
                 except Exception:
@@ -2644,7 +2732,7 @@ class MainWindow(QMainWindow):
                         item.setDownsampling(auto=True, method='peak')
                     except Exception:
                         pass
-                # Some versions support skipping finite checks for speed
+                # 部分版本支持跳过有限性检查以提速
                 try:
                     item.setSkipFiniteCheck(True)
                 except Exception:
@@ -2654,7 +2742,7 @@ class MainWindow(QMainWindow):
 
     @Slot(float, dict)
     def on_data_ready(self, ts: float, row: dict):
-        # Convert incoming timestamp to a smooth, relative monotonic time base.
+        # 将输入时间戳转换为平滑的相对单调时间基准。
         mono_now = time.monotonic()
         if self._t0_mono_ts is None:
             self._t0_mono_ts = float(mono_now)
@@ -2669,7 +2757,7 @@ class MainWindow(QMainWindow):
         except Exception:
             wall_ts = time.time()
 
-        # Lazily init curves + buffers on first frame (兼容未点击开始采集时的数据)
+        # 首帧懒初始化曲线与缓冲区（兼容未点击开始采集时的数据）
         if not self.channel_names:
             self.channel_names = list(row.keys())
             self.init_curves(self.channel_names)
@@ -2679,7 +2767,7 @@ class MainWindow(QMainWindow):
                 size = int(getattr(self, '_buf_size', 100) or 100)
             self._alloc_ring_buffers(size, list(self.channel_names), keep_last=False)
 
-        # Keep buffer size synced with UI
+        # 保持缓冲区大小与 UI 同步
         try:
             want = int(self.max_points_spin.value())
         except Exception:
@@ -2692,7 +2780,7 @@ class MainWindow(QMainWindow):
             return
         i = int(getattr(self, '_buf_idx', 0) or 0) % size
 
-        # Append to ring buffer (array size == 当前窗口最大点数)
+        # 追加到环形缓冲区（数组大小 == 当前窗口最大点数）
         if np is not None:
             try:
                 self._ts_buf[i] = float(rel_ts)
@@ -2720,7 +2808,7 @@ class MainWindow(QMainWindow):
             for name in self.channel_names:
                 self._val_buf_by_channel[name][i] = row.get(name, None)
 
-        # update derived friction buffers
+        # 更新派生的摩擦相关缓冲
         self._update_friction_buffers_at_index(i, row)
         try:
             if getattr(self, "_log_db_path", ""):
@@ -2737,7 +2825,7 @@ class MainWindow(QMainWindow):
 
 
     def update_plot(self):
-        """Update plot curves (buffered + 刷新率驱动)."""
+        """更新绘图曲线（缓冲 + 刷新率驱动）。"""
         count = int(getattr(self, "_buf_count", 0) or 0)
         if count <= 0 or not self.channel_names:
             return
@@ -2751,9 +2839,9 @@ class MainWindow(QMainWindow):
             return
         idx = int(getattr(self, "_buf_idx", 0) or 0) % size
         full = (count >= size)
-        # Smooth X scrolling (live): drive the right edge by monotonic time.
-        # When NOT acquiring (stopped/paused), freeze scrolling and do NOT
-        # keep forcing XRange updates (so users can pan/zoom the last frame).
+        # 平滑 X 滚动（实时）：用单调时间驱动右边界。
+        # 当未采集（停止/暂停）时，冻结滚动且不要
+        # 强制更新 XRange（便于用户平移/缩放最后一帧）。
         scroll_live = bool(getattr(self, 'is_acquiring', False)) and (not bool(getattr(self, 'is_paused', False)))
 
         try:
@@ -2765,7 +2853,7 @@ class MainWindow(QMainWindow):
         except Exception:
             now_rel = float(self._last_sample_rel_ts) if self._last_sample_rel_ts is not None else 0.0
 
-        # Visible window width in seconds: max_points * poll_interval
+        # 可见窗口宽度（秒）：max_points * poll_interval
         try:
             poll_ms = int(self.poll_spin.value()) if hasattr(self, 'poll_spin') else 20
         except Exception:
@@ -2776,8 +2864,8 @@ class MainWindow(QMainWindow):
         x_left = now_rel - span
         x_right = now_rel
 
-        # Fast path: if no new samples arrived, avoid re-uploading curve data.
-        # Keep only X scrolling (smooth) while reducing CPU/GPU overhead.
+        # 快速路径：没有新样本时避免重新上传曲线数据。
+        # 只保持 X 平滑滚动，同时减少 CPU/GPU 开销。
         if not new_data:
             if scroll_live:
                 try:
@@ -2794,7 +2882,7 @@ class MainWindow(QMainWindow):
                     pass
             return
 
-        # Prepare ordered X view only when uploading new curve data.
+        # 仅在上传新曲线数据时准备有序 X 视图。
         xs = None
         if new_data:
             if np is not None:
@@ -2813,7 +2901,7 @@ class MainWindow(QMainWindow):
                 if not xs:
                     xs = None
 
-        # Prevent multiple repaints during one update (helps on Windows).
+        # 防止一次更新中多次重绘（对 Windows 有帮助）。
         self.plot.setUpdatesEnabled(False)
         try:
             global_y_min = None
@@ -2840,7 +2928,7 @@ class MainWindow(QMainWindow):
 
                     curve = self.curves.get(name)
                     if curve is not None:
-                        # Limit points sent to renderer when buffer is huge.
+                        # 缓冲区很大时限制发送到渲染器的点数。
                         xs_use, ys_use = xs, ys
                         try:
                             max_disp = int(getattr(self, '_max_display_points', 0) or 0)
@@ -2858,10 +2946,10 @@ class MainWindow(QMainWindow):
                                         xs_use = xs_use[::step]
                                         ys_use = ys_use[::step]
                                     except Exception:
-                                        # fallback: no decimation
+                                        # 兜底：不降采样
                                         xs_use, ys_use = xs, ys
 
-                        # Prefer skipping finite checks when supported
+                        # 支持时优先跳过有限性检查
                         try:
                             curve.setData(xs_use, ys_use, connect='finite', skipFiniteCheck=True)
                         except Exception:
@@ -2875,7 +2963,7 @@ class MainWindow(QMainWindow):
                             global_y_min = y_min if global_y_min is None else min(global_y_min, y_min)
                             global_y_max = y_max if global_y_max is None else max(global_y_max, y_max)
             elif new_data and xs is not None:
-                # Fallback (no numpy)
+                # 兜底（无 numpy）
                 for name in self.channel_names:
                     buf = self._val_buf_by_channel.get(name, [])
                     if not full:
@@ -2900,16 +2988,16 @@ class MainWindow(QMainWindow):
                         global_y_max = y_max if global_y_max is None else max(global_y_max, y_max)
 
             now = time.monotonic()
-            # Smooth scrolling: keep a fixed visible window ending at "now".
-            # Only do this while acquiring; after stop/pause we freeze and let
-            # the user inspect/pan without being overridden by the timer.
+            # 平滑滚动：保持以“现在”为右边界的固定可见窗口。
+            # 仅在采集中执行；停止/暂停后冻结并让
+            # 用户检查/平移，不被计时器覆盖。
             if scroll_live:
                 try:
                     self.plot.setXRange(x_left, x_right, padding=0.0)
                 except Exception:
                     pass
 
-            # Y range update with hysteresis to reduce jitter/flicker
+            # Y 轴范围带滞回更新以减少抖动/闪烁
             if self.autoscale_chk.isChecked() and global_y_min is not None and global_y_max is not None:
                 if (now - float(getattr(self, "_last_yrange_update", 0.0))) >= 1.0:
                     if global_y_min == global_y_max:
@@ -2928,7 +3016,7 @@ class MainWindow(QMainWindow):
                         cur_span = cur_max - cur_min
                         if cur_span > 0:
                             margin = cur_span * 0.05
-                            # If new range is mostly inside current range, skip update.
+                            # 如果新范围大多落在当前范围内，则跳过更新。
                             if (new_min >= (cur_min + margin)) and (new_max <= (cur_max - margin)):
                                 apply = False
                     except Exception:
@@ -2939,7 +3027,7 @@ class MainWindow(QMainWindow):
                         self._last_yrange_update = now
         finally:
             self.plot.setUpdatesEnabled(True)
-            # Request a single repaint after updating all curves.
+            # 更新所有曲线后只请求一次重绘。
             self.plot.update()
 
         try:
@@ -2950,7 +3038,7 @@ class MainWindow(QMainWindow):
         self._last_plotted_seq = int(getattr(self, "_plot_seq", 0) or 0)
 
 
-    # ---------- connect/acquire ----------
+    # ---------- 连接/采集 ----------
     def toggle_connect(self):
         if self.is_connected:
             self.disconnect_serial()
@@ -3093,15 +3181,15 @@ class MainWindow(QMainWindow):
 
         self.worker.update_runtime(unit_id, func_code, poll_ms, address_base_1, enabled_channels, tx_interval_ms=int(self.tx_interval_spin.value()))
 
-        # reset plot data at start
+        # 开始时重置绘图数据
         self.clear_data()
-        # reset pause-compensation for timeline
+        # 重置时间轴的暂停补偿
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
         self.channel_names = [c.name for c in enabled_channels]
         self._log_units = [self._last_unit_map.get(c.name, "") for c in enabled_channels]
         self.init_curves(self.channel_names)
-        # allocate ring buffer with current max points
+        # 按当前最大点数分配环形缓冲区
         try:
             size = int(self.max_points_spin.value())
         except Exception:
@@ -3150,7 +3238,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self.is_paused:
-            # pause
+            # 暂停
             self.worker.set_acquiring(False)
             self.is_acquiring = False
             self.is_paused = True
@@ -3158,7 +3246,7 @@ class MainWindow(QMainWindow):
             self.pause_btn.setText("继续")
             self.set_status("已暂停（保持连接）")
         else:
-            # resume
+            # 继续
             try:
                 if getattr(self, '_mono_pause_start', None) is not None:
                     self._mono_pause_accum = float(getattr(self, '_mono_pause_accum', 0.0) or 0.0) + max(0.0, float(time.monotonic() - float(self._mono_pause_start)))
@@ -3182,7 +3270,7 @@ class MainWindow(QMainWindow):
         self.is_acquiring = bool(on)
 
 
-    # ---------- data logging ----------
+    # ---------- 数据记录 ----------
     def _start_data_logger(self, channel_names: List[str], channel_units: Optional[List[str]] = None):
         try:
             if not channel_names:
@@ -3275,7 +3363,7 @@ class MainWindow(QMainWindow):
                 ws_all.cell(row=r, column=col_idx, value=v)
                 col_idx += 1
 
-            # friction / mu
+            # 摩擦力 / μ
             high_v = None
             low_v = None
             if hi_name and hi_name in self.channel_names:
@@ -3292,7 +3380,7 @@ class MainWindow(QMainWindow):
             ws_all.cell(row=r, column=col_idx, value=fric_n)
             ws_all.cell(row=r, column=col_idx + 1, value=mu)
 
-        # per-channel sheets (small data only)
+        # 每通道工作表（仅小数据量）
         for i, name in enumerate(self.channel_names):
             ws = wb.create_sheet(title=self._safe_sheet_name(name))
             ws.cell(row=1, column=1, value="Time")
@@ -3307,7 +3395,7 @@ class MainWindow(QMainWindow):
                 v = vals[r] if r < len(vals) else None
                 ws.cell(row=r + 2, column=2, value=v)
 
-        # friction sheet
+        # 摩擦力工作表
         ws_f = wb.create_sheet(title="摩擦力")
         ws_f.cell(row=1, column=1, value="Time")
         ws_f.cell(row=1, column=2, value="摩擦力(N【牛】)")
@@ -3317,7 +3405,7 @@ class MainWindow(QMainWindow):
         for r, rel_ts in enumerate(xs, start=2):
             wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
-            # recompute with current config
+            # 使用当前配置重新计算
             fric_n = None
             mu = None
             if hi_name and lo_name and hi_name in ys_map and lo_name in ys_map:
@@ -3339,7 +3427,7 @@ class MainWindow(QMainWindow):
         wb.save(path)
 
     def _export_xlsx_from_db(self, db_path: str, path: str):
-        # flush queued rows (best-effort)
+        # 刷新排队行（尽力而为）
         try:
             if self._data_logger:
                 self._data_logger.flush(wait=True, timeout=3.0)
@@ -3413,7 +3501,122 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # ---------- export ----------
+    def export_history_db(self):
+        data_dir = os.path.join(os.getcwd(), "data_logs")
+        if not os.path.isdir(data_dir):
+            QMessageBox.information(self, "提示", "未找到 data_logs 目录。请先采集数据生成历史数据库。")
+            return
+
+        db_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择历史数据库",
+            data_dir,
+            "SQLite DB (*.sqlite *.db);;All Files (*.*)"
+        )
+        if not db_path:
+            return
+        if not os.path.isfile(db_path):
+            QMessageBox.warning(self, "提示", "数据库文件不存在。")
+            return
+
+        base = os.path.splitext(os.path.basename(db_path))[0]
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出为 XLSX",
+            os.path.join(data_dir, f"{base}.xlsx"),
+            "Excel Files (*.xlsx)"
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".xlsx"):
+            out_path += ".xlsx"
+
+        try:
+            self._export_xlsx_from_db(db_path, out_path)
+            self.set_status(f"已保存：{out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出历史数据库失败：\n{e}")
+
+    def open_history_dialog(self):
+        data_dir = os.path.join(os.getcwd(), "data_logs")
+        dlg = HistoryDbDialog(self, data_dir, self._export_history_db_path)
+        dlg.exec()
+
+    def _build_history_menu(self):
+        if not hasattr(self, "hist_menu") or self.hist_menu is None:
+            return
+        self.hist_menu.clear()
+
+        act_refresh = self.hist_menu.addAction("刷新历史数据库")
+        act_refresh.triggered.connect(self._build_history_menu)
+
+        act_pick = self.hist_menu.addAction("选择历史数据库导出...")
+        act_pick.triggered.connect(self.open_history_dialog)
+
+        self.hist_menu.addSeparator()
+
+        data_dir = os.path.join(os.getcwd(), "data_logs")
+        if not os.path.isdir(data_dir):
+            act_empty = self.hist_menu.addAction("(未找到 data_logs 目录)")
+            act_empty.setEnabled(False)
+            return
+
+        db_files = []
+        try:
+            for name in os.listdir(data_dir):
+                if not name.lower().endswith((".sqlite", ".db")):
+                    continue
+                full = os.path.join(data_dir, name)
+                if os.path.isfile(full):
+                    try:
+                        mtime = os.path.getmtime(full)
+                    except Exception:
+                        mtime = 0.0
+                    db_files.append((mtime, full))
+        except Exception:
+            db_files = []
+
+        if not db_files:
+            act_none = self.hist_menu.addAction("(无历史数据库)")
+            act_none.setEnabled(False)
+            return
+
+        db_files.sort(key=lambda x: x[0], reverse=True)
+        max_items = 10
+        for mtime, full in db_files[:max_items]:
+            base = os.path.splitext(os.path.basename(full))[0]
+            try:
+                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(mtime)))
+            except Exception:
+                ts_str = "未知时间"
+            label = f"{ts_str}  |  {base}"
+            act = self.hist_menu.addAction(label)
+            act.triggered.connect(lambda _=False, p=full: self._export_history_db_path(p))
+
+    def _export_history_db_path(self, db_path: str):
+        if not db_path or not os.path.isfile(db_path):
+            QMessageBox.warning(self, "提示", "数据库文件不存在。")
+            return
+        data_dir = os.path.dirname(db_path)
+        base = os.path.splitext(os.path.basename(db_path))[0]
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出为 XLSX",
+            os.path.join(data_dir, f"{base}.xlsx"),
+            "Excel Files (*.xlsx)"
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".xlsx"):
+            out_path += ".xlsx"
+
+        try:
+            self._export_xlsx_from_db(db_path, out_path)
+            self.set_status(f"已保存：{out_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出历史数据库失败：\n{e}")
+
+    # ---------- 导出 ----------
     def save_xlsx(self):
         db_path = self._log_db_path if getattr(self, "_log_db_path", "") else ""
         use_db = self._db_has_data(db_path)
@@ -3458,7 +3661,7 @@ class MainWindow(QMainWindow):
                 if v is None:
                     continue
                 s = str(v)
-                # Count CJK wide chars as width=2 for better Excel column sizing
+                # 将 CJK 宽字符按宽度 2 计算，便于 Excel 列宽调整
                 width = 0
                 for ch in s:
                     width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -3478,12 +3681,12 @@ class MainWindow(QMainWindow):
                 pass
 
     def closeEvent(self, event):
-        # Persist workspace layout (dock positions / splitter sizes / window geometry)
+        # 持久化工作区布局（停靠位置/分割器尺寸/窗口几何）
         try:
             self._save_window_layout()
         except Exception:
             pass
-        # Ensure serial threads are stopped before exit
+        # 确保退出前串口线程已停止
         try:
             self.disconnect_serial()
         except Exception:
