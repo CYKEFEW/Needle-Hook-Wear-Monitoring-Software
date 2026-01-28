@@ -694,9 +694,10 @@ class ModbusRtuWorker(QThread):
                             except Exception:
                                 row[sp.ch.name] = None
 
-                    if any_success:
-                        self.data_ready.emit(ts, row)
+                    # Always emit a sample so UI can handle gaps/quality flags.
+                    self.data_ready.emit(ts, row)
 
+                    if any_success:
                         # build and store latest output line; actual sending is periodic
                         if self.tx_enabled and self._tx_ser is not None:
                             try:

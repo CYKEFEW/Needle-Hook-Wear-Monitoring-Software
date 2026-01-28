@@ -2,11 +2,14 @@
 """Modbus 助手主界面窗口。"""
 
 import math
+import concurrent.futures
 import os
 import sqlite3
 import time
+import tempfile
+import zipfile
 import unicodedata
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pyqtgraph as pg
 from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
@@ -24,12 +27,12 @@ except Exception:  # pragma: no cover
     np = None
 
 from qt_compat import (
-    Qt, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit,
+    Qt, QThread, Signal, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit,
     QSpinBox, QDoubleSpinBox, QCheckBox, QHBoxLayout, QVBoxLayout, QGridLayout,
     QGroupBox, QTableWidget, QTableWidgetItem, QMessageBox, QFileDialog,
     QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter,
     QSizePolicy, QTimer, QSettings, QPoint, QTextCursor, QGuiApplication, QApplication,
-    Slot, QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox,
+    Slot, QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox, QProgressBar,
 )
 
 from modbus_utils import ChannelConfig, DTYPE_INFO, hex_bytes
@@ -44,32 +47,122 @@ class HistoryDbDialog(QDialog):
         super().__init__(parent)
         self._data_dir = data_dir
         self._export_cb = export_cb
-        self.setWindowTitle("历史数据库")
-        self.resize(560, 420)
+        self._bulk_updating = False
+        self.setWindowTitle("管理数据库")
+        self.resize(620, 460)
 
         root = QVBoxLayout(self)
-        info = QLabel("选择历史数据库后导出为 XLSX")
+        info = QLabel("管理历史数据库，可导出或删除。")
         root.addWidget(info)
 
+        top_row = QHBoxLayout()
+        self.select_all_chk = QCheckBox("全选")
+        try:
+            self.select_all_chk.setTristate(True)
+        except Exception:
+            pass
+        top_row.addWidget(self.select_all_chk)
+        top_row.addStretch(1)
+        root.addLayout(top_row)
+
         self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         root.addWidget(self.list, 1)
 
         btns = QDialogButtonBox()
         self.btn_refresh = QPushButton("刷新")
         self.btn_export = QPushButton("导出")
+        self.btn_delete = QPushButton("删除")
         self.btn_close = QPushButton("关闭")
         btns.addButton(self.btn_refresh, QDialogButtonBox.ActionRole)
         btns.addButton(self.btn_export, QDialogButtonBox.AcceptRole)
+        btns.addButton(self.btn_delete, QDialogButtonBox.DestructiveRole)
         btns.addButton(self.btn_close, QDialogButtonBox.RejectRole)
         root.addWidget(btns)
 
         self.btn_refresh.clicked.connect(self.reload)
         self.btn_export.clicked.connect(self.export_selected)
+        self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_close.clicked.connect(self.reject)
         self.list.itemDoubleClicked.connect(lambda *_: self.export_selected())
+        self.select_all_chk.clicked.connect(self._on_select_all_changed)
+        self.list.itemChanged.connect(self._on_item_changed)
 
         self.reload()
+
+    def _iter_items(self):
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if not item:
+                continue
+            path = item.data(Qt.UserRole)
+            if not path:
+                continue
+            yield item, path
+
+    def _checked_paths(self):
+        paths = []
+        for item, path in self._iter_items():
+            if item.checkState() == Qt.Checked:
+                paths.append(path)
+        return paths
+
+    def _selected_paths(self):
+        paths = []
+        for item in self.list.selectedItems() or []:
+            path = item.data(Qt.UserRole)
+            if path:
+                paths.append(path)
+        return paths
+
+    def _get_action_paths(self):
+        paths = self._checked_paths()
+        if paths:
+            return paths
+        return self._selected_paths()
+
+    def _update_select_all_state(self):
+        if self._bulk_updating:
+            return
+        self._bulk_updating = True
+        try:
+            total = 0
+            checked = 0
+            for item, _ in self._iter_items():
+                total += 1
+                if item.checkState() == Qt.Checked:
+                    checked += 1
+            if total == 0:
+                self.select_all_chk.setCheckState(Qt.Unchecked)
+                self.select_all_chk.setEnabled(False)
+            else:
+                self.select_all_chk.setEnabled(True)
+                if checked == 0:
+                    self.select_all_chk.setCheckState(Qt.Unchecked)
+                elif checked == total:
+                    self.select_all_chk.setCheckState(Qt.Checked)
+                else:
+                    self.select_all_chk.setCheckState(Qt.PartiallyChecked)
+        finally:
+            self._bulk_updating = False
+
+    def _on_select_all_changed(self, state):
+        if self._bulk_updating:
+            return
+        self._bulk_updating = True
+        try:
+            if isinstance(state, bool):
+                checked = state
+            else:
+                checked = state == Qt.Checked
+            for item, _ in self._iter_items():
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        finally:
+            self._bulk_updating = False
+        self._update_select_all_state()
+
+    def _on_item_changed(self, *_):
+        self._update_select_all_state()
 
     def reload(self):
         self.list.clear()
@@ -77,6 +170,7 @@ class HistoryDbDialog(QDialog):
             item = QListWidgetItem("(未找到 data_logs 目录)")
             item.setFlags(Qt.NoItemFlags)
             self.list.addItem(item)
+            self._update_select_all_state()
             return
 
         db_files = []
@@ -98,6 +192,7 @@ class HistoryDbDialog(QDialog):
             item = QListWidgetItem("(无历史数据库)")
             item.setFlags(Qt.NoItemFlags)
             self.list.addItem(item)
+            self._update_select_all_state()
             return
 
         db_files.sort(key=lambda x: x[0], reverse=True)
@@ -110,17 +205,294 @@ class HistoryDbDialog(QDialog):
             label = f"{ts_str}  |  {base}"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, full)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Unchecked)
             self.list.addItem(item)
 
+        self._update_select_all_state()
+
     def export_selected(self):
-        item = self.list.currentItem()
-        if not item:
+        paths = self._get_action_paths()
+        if not paths:
+            QMessageBox.information(self, "提示", "请先选择要导出的数据库。")
             return
-        path = item.data(Qt.UserRole)
-        if not path:
+        parent = self.parent()
+        if parent and hasattr(parent, "queue_export_db_paths"):
+            parent.queue_export_db_paths(paths)
             return
+        QMessageBox.warning(self, "提示", "无法导出，请在主界面操作。")
+
+    def delete_selected(self):
+        paths = self._get_action_paths()
+        if not paths:
+            QMessageBox.information(self, "提示", "请先选择要删除的数据库。")
+            return
+        count = len(paths)
+        tip = f"确定删除选中的 {count} 个数据库文件吗？\n此操作不可恢复。"
+        if QMessageBox.question(self, "确认删除", tip) != QMessageBox.Yes:
+            return
+        failed = []
+        for path in paths:
+            try:
+                os.remove(path)
+            except Exception:
+                failed.append(path)
+        if failed:
+            QMessageBox.warning(self, "删除失败", "以下文件删除失败：\n" + "\n".join(failed))
+        self.reload()
+
+class ExportQueueWorker(QThread):
+    progress = Signal(str, int, int)
+    status = Signal(str, str)
+    phase = Signal(str)
+    finished = Signal(list, list, str)
+
+    def __init__(self, tasks, export_func, max_workers=8, zip_path=""):
+        super().__init__()
+        self._tasks = tasks or []
+        self._export_func = export_func
+        self._max_workers = max(1, int(max_workers))
+        self._zip_path = zip_path or ""
+
+    def run(self):
+        exported = []
+        failed = []
+        zip_path = self._zip_path
+
+        def progress_cb(ctx, done, total):
+            try:
+                total_i = int(total) if total is not None else -1
+            except Exception:
+                total_i = -1
+            try:
+                done_i = int(done)
+            except Exception:
+                done_i = 0
+            self.progress.emit(str(ctx), done_i, total_i)
+
+        def run_one(task):
+            db_path = task.get("db_path") or ""
+            out_path = task.get("out_path") or ""
+            if not db_path:
+                return False, ("", "")
+            self.status.emit(db_path, "导出中")
+            try:
+                self._export_func(db_path, out_path, progress_cb=progress_cb, progress_ctx=db_path)
+                self.status.emit(db_path, "完成")
+                return True, (db_path, out_path)
+            except Exception:
+                self.status.emit(db_path, "失败")
+                return False, (db_path, "")
+
+        tmp_ctx = None
+        if zip_path:
+            tmp_ctx = tempfile.TemporaryDirectory()
+            for task in self._tasks:
+                if task.get("out_path"):
+                    continue
+                db_path = task.get("db_path") or ""
+                base = os.path.splitext(os.path.basename(db_path))[0]
+                task["out_path"] = os.path.join(tmp_ctx.name, base + ".xlsx")
+
         try:
-            self._export_cb(path)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as ex:
+                futures = [ex.submit(run_one, task) for task in self._tasks]
+                for fut in concurrent.futures.as_completed(futures):
+                    ok, payload = fut.result()
+                    if ok:
+                        exported.append(payload)
+                    else:
+                        failed.append(payload[0])
+
+            if zip_path and exported:
+                self.phase.emit("打包中")
+                try:
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for db_path, out_path in exported:
+                            if not out_path:
+                                continue
+                            arc_name = os.path.basename(out_path)
+                            zf.write(out_path, arcname=arc_name)
+                    self.phase.emit("打包完成")
+                except Exception:
+                    self.phase.emit("打包失败")
+        finally:
+            try:
+                if tmp_ctx is not None:
+                    tmp_ctx.cleanup()
+            except Exception:
+                pass
+
+        self.finished.emit([p for p, _ in exported], failed, zip_path)
+
+
+class ExportQueueDialog(QDialog):
+    def __init__(self, parent, export_func):
+        super().__init__(parent)
+        self._export_func = export_func
+        self._tasks = []
+        self._task_info = {}
+        self._worker = None
+        self._zip_path = ""
+        self._start_ts = None
+
+        self.setWindowTitle("导出队列")
+        self.resize(720, 480)
+
+        root = QVBoxLayout(self)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("最大线程："))
+        self.thread_spin = QSpinBox()
+        self.thread_spin.setRange(1, 64)
+        self.thread_spin.setValue(8)
+        top_row.addWidget(self.thread_spin)
+        top_row.addStretch(1)
+        root.addLayout(top_row)
+
+        self.status_label = QLabel("状态：空闲")
+        self.eta_label = QLabel("预计剩余时间：--")
+        root.addWidget(self.status_label)
+        root.addWidget(self.eta_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        root.addWidget(self.progress_bar)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["数据库", "状态", "进度"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        root.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_close = QPushButton("关闭")
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_close)
+        root.addLayout(btn_row)
+
+        self.btn_close.clicked.connect(self.hide)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._update_eta)
+
+    def enqueue_exports(self, tasks, zip_path=""):
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "正在导出，请等待完成。")
+            return False
+        if not tasks:
+            return False
+        self._zip_path = zip_path or ""
+        self._tasks = tasks
+        self._build_table()
+        self.start_export()
+        return True
+
+    def _build_table(self):
+        self._task_info = {}
+        self.table.setRowCount(len(self._tasks))
+        for row, task in enumerate(self._tasks):
+            db_path = task.get("db_path") or ""
+            name = os.path.basename(db_path)
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem("等待"))
+            self.table.setItem(row, 2, QTableWidgetItem("0%"))
+            self._task_info[db_path] = {"row": row, "done": 0, "total": 0, "status": "等待"}
+
+    def start_export(self):
+        if not self._tasks:
+            return
+        self.progress_bar.setValue(0)
+        self.status_label.setText("状态：导出中")
+        self.eta_label.setText("预计剩余时间：计算中")
+        self._start_ts = time.time()
+        self.thread_spin.setEnabled(False)
+
+        self._worker = ExportQueueWorker(self._tasks, self._export_func, self.thread_spin.value(), self._zip_path)
+        self._worker.progress.connect(self._on_task_progress)
+        self._worker.status.connect(self._on_task_status)
+        self._worker.phase.connect(self._on_phase)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+        self._timer.start()
+
+    def _on_task_progress(self, db_path, done, total):
+        info = self._task_info.get(db_path)
+        if not info:
+            return
+        info["done"] = max(0, int(done))
+        if total is not None and int(total) > 0:
+            info["total"] = int(total)
+        self._update_row_progress(db_path)
+
+    def _on_task_status(self, db_path, status):
+        info = self._task_info.get(db_path)
+        if not info:
+            return
+        info["status"] = status
+        row = info["row"]
+        item = self.table.item(row, 1)
+        if item:
+            item.setText(status)
+
+    def _on_phase(self, phase):
+        self.status_label.setText(f"状态：{phase}")
+
+    def _on_finished(self, ok_paths, failed_paths, zip_path):
+        self._timer.stop()
+        self.thread_spin.setEnabled(True)
+        self.progress_bar.setValue(100)
+        if failed_paths:
+            self.status_label.setText("状态：已完成（部分失败）")
+        else:
+            self.status_label.setText("状态：已完成")
+
+    def _update_row_progress(self, db_path):
+        info = self._task_info.get(db_path)
+        if not info:
+            return
+        row = info["row"]
+        done = info.get("done", 0)
+        total = info.get("total", 0)
+        if total > 0:
+            pct = min(100.0, 100.0 * float(done) / float(total))
+            text = f"{pct:.1f}% ({done}/{total})"
+        else:
+            text = f"{done}"
+        item = self.table.item(row, 2)
+        if item:
+            item.setText(text)
+
+    def _update_eta(self):
+        try:
+            total = 0
+            done = 0
+            for info in self._task_info.values():
+                if info.get("total", 0) > 0:
+                    total += info.get("total", 0)
+                    done += min(info.get("done", 0), info.get("total", 0))
+            if total <= 0:
+                self.eta_label.setText("预计剩余时间：计算中")
+                return
+            if self._start_ts is None:
+                return
+            elapsed = max(0.001, time.time() - float(self._start_ts))
+            rate = float(done) / elapsed if done > 0 else 0.0
+            if rate <= 0:
+                self.eta_label.setText("预计剩余时间：计算中")
+                return
+            remain = max(0.0, float(total - done) / rate)
+            mm = int(remain // 60)
+            ss = int(remain % 60)
+            self.eta_label.setText(f"预计剩余时间：{mm:02d}:{ss:02d}")
+            pct = min(100.0, 100.0 * float(done) / float(total))
+            self.progress_bar.setValue(int(pct))
         except Exception:
             pass
 
@@ -156,6 +528,7 @@ class MainWindow(QMainWindow):
         self._mu_buf = None
         self._fric_plot_y = None
         self._mu_plot_y = None
+        self._qf_buf = None
         self._plot_seq = 0
 
         self._last_plotted_seq = -1
@@ -172,6 +545,18 @@ class MainWindow(QMainWindow):
         self._fric_low_name = ""
         self._wrap_angle_deg = 0.0
         self._wrap_angle_rad = 0.0
+        self._quality_flag_name = "质量标志"
+        self._quality_flag_label = "质量标志（quality flag）【0为无效，1为有效】"
+        self._quality_gap_pending: List[dict] = []
+        self._quality_gap_hold_mode = False
+        self._quality_gap_start_mono = None
+        self._quality_gap_triggered = False
+        self._last_valid_row: Optional[Dict[str, float]] = None
+        self._last_tension_setpoint: Optional[float] = None
+        self._quality_last_source = "mu"
+        self._quality_syncing = False
+        self._quality_ui_syncing = False
+        self._quality_gap_timeout_s = 1.0
         self._data_logger = DataLogger(base_dir=os.path.join(os.getcwd(), "data_logs"))
         self._log_db_path = ""
         self._log_channels: List[str] = []
@@ -508,8 +893,30 @@ class MainWindow(QMainWindow):
         self.wrap_angle_spin.setDecimals(2)
         self.wrap_angle_spin.setRange(0.0, 360.0)
         self.wrap_angle_spin.setSingleStep(1.0)
-        self.wrap_angle_spin.setValue(0.0)
+        self.wrap_angle_spin.setValue(10.0)
         self.wrap_angle_spin.setSuffix(" °")
+        self.rmin_spin = QDoubleSpinBox()
+        self.rmin_spin.setDecimals(4)
+        self.rmin_spin.setRange(0.0, 1000.0)
+        self.rmin_spin.setSingleStep(0.01)
+        self.rmin_spin.setValue(1.01)
+        self.mu_max_spin = QDoubleSpinBox()
+        self.mu_max_spin.setDecimals(4)
+        self.mu_max_spin.setRange(0.0, 10.0)
+        self.mu_max_spin.setSingleStep(0.01)
+        self.mu_max_spin.setValue(0.5)
+        self.rmax_spin = QDoubleSpinBox()
+        self.rmax_spin.setDecimals(6)
+        self.rmax_spin.setRange(0.0, 1e6)
+        self.rmax_spin.setSingleStep(0.01)
+        self.rmax_spin.setValue(1.0)
+        self.rmax_formula_label = QLabel("Rmax=exp(μmax·θ)")
+        self.qgap_spin = QDoubleSpinBox()
+        self.qgap_spin.setDecimals(2)
+        self.qgap_spin.setRange(0.05, 10.0)
+        self.qgap_spin.setSingleStep(0.05)
+        self.qgap_spin.setValue(1.0)
+        self.qgap_spin.setSuffix(" s")
         cfg.addWidget(QLabel("高张力侧"), 0, 0)
         cfg.addWidget(self.fric_high_combo, 0, 1)
         cfg.addWidget(QLabel("低张力侧"), 0, 2)
@@ -517,6 +924,15 @@ class MainWindow(QMainWindow):
         cfg.addWidget(self.fric_swap_btn, 0, 4)
         cfg.addWidget(QLabel("包角"), 1, 0)
         cfg.addWidget(self.wrap_angle_spin, 1, 1)
+        cfg.addWidget(QLabel("Rmin"), 2, 0)
+        cfg.addWidget(self.rmin_spin, 2, 1)
+        cfg.addWidget(QLabel("μmax"), 2, 2)
+        cfg.addWidget(self.mu_max_spin, 2, 3)
+        cfg.addWidget(QLabel("Rmax"), 3, 0)
+        cfg.addWidget(self.rmax_spin, 3, 1)
+        cfg.addWidget(self.rmax_formula_label, 3, 2, 1, 3)
+        cfg.addWidget(QLabel("丢包/解析失败超时(s)"), 4, 0)
+        cfg.addWidget(self.qgap_spin, 4, 1)
         cfg.setColumnStretch(5, 1)
         f_layout.addLayout(cfg)
         f_layout.addWidget(self.friction_plot, 1)
@@ -532,8 +948,30 @@ class MainWindow(QMainWindow):
         self.mu_wrap_angle_spin.setDecimals(2)
         self.mu_wrap_angle_spin.setRange(0.0, 360.0)
         self.mu_wrap_angle_spin.setSingleStep(1.0)
-        self.mu_wrap_angle_spin.setValue(0.0)
+        self.mu_wrap_angle_spin.setValue(10.0)
         self.mu_wrap_angle_spin.setSuffix(" °")
+        self.rmin_spin_mu = QDoubleSpinBox()
+        self.rmin_spin_mu.setDecimals(4)
+        self.rmin_spin_mu.setRange(0.0, 1000.0)
+        self.rmin_spin_mu.setSingleStep(0.01)
+        self.rmin_spin_mu.setValue(1.01)
+        self.mu_max_spin_mu = QDoubleSpinBox()
+        self.mu_max_spin_mu.setDecimals(4)
+        self.mu_max_spin_mu.setRange(0.0, 10.0)
+        self.mu_max_spin_mu.setSingleStep(0.01)
+        self.mu_max_spin_mu.setValue(0.5)
+        self.rmax_spin_mu = QDoubleSpinBox()
+        self.rmax_spin_mu.setDecimals(6)
+        self.rmax_spin_mu.setRange(0.0, 1e6)
+        self.rmax_spin_mu.setSingleStep(0.01)
+        self.rmax_spin_mu.setValue(1.0)
+        self.rmax_formula_label_mu = QLabel("Rmax=exp(μmax·θ)")
+        self.qgap_spin_mu = QDoubleSpinBox()
+        self.qgap_spin_mu.setDecimals(2)
+        self.qgap_spin_mu.setRange(0.05, 10.0)
+        self.qgap_spin_mu.setSingleStep(0.05)
+        self.qgap_spin_mu.setValue(1.0)
+        self.qgap_spin_mu.setSuffix(" s")
         mu_cfg.addWidget(QLabel("高张力侧"), 0, 0)
         mu_cfg.addWidget(self.mu_high_combo, 0, 1)
         mu_cfg.addWidget(QLabel("低张力侧"), 0, 2)
@@ -541,6 +979,15 @@ class MainWindow(QMainWindow):
         mu_cfg.addWidget(self.mu_swap_btn, 0, 4)
         mu_cfg.addWidget(QLabel("包角"), 1, 0)
         mu_cfg.addWidget(self.mu_wrap_angle_spin, 1, 1)
+        mu_cfg.addWidget(QLabel("Rmin"), 2, 0)
+        mu_cfg.addWidget(self.rmin_spin_mu, 2, 1)
+        mu_cfg.addWidget(QLabel("μmax"), 2, 2)
+        mu_cfg.addWidget(self.mu_max_spin_mu, 2, 3)
+        mu_cfg.addWidget(QLabel("Rmax"), 3, 0)
+        mu_cfg.addWidget(self.rmax_spin_mu, 3, 1)
+        mu_cfg.addWidget(self.rmax_formula_label_mu, 3, 2, 1, 3)
+        mu_cfg.addWidget(QLabel("丢包/解析失败超时(s)"), 4, 0)
+        mu_cfg.addWidget(self.qgap_spin_mu, 4, 1)
         mu_cfg.setColumnStretch(5, 1)
         mu_layout.addLayout(mu_cfg)
         mu_layout.addWidget(self.mu_plot, 1)
@@ -561,11 +1008,19 @@ class MainWindow(QMainWindow):
         self.fric_high_combo.currentIndexChanged.connect(self._on_friction_config_changed)
         self.fric_low_combo.currentIndexChanged.connect(self._on_friction_config_changed)
         self.wrap_angle_spin.valueChanged.connect(self._on_friction_config_changed)
+        self.rmin_spin.valueChanged.connect(self._on_quality_rmin_changed)
+        self.mu_max_spin.valueChanged.connect(self._on_quality_mu_max_changed)
+        self.rmax_spin.valueChanged.connect(self._on_quality_rmax_changed)
+        self.qgap_spin.valueChanged.connect(self._on_quality_gap_timeout_changed)
         self.fric_swap_btn.clicked.connect(self._swap_friction_channels)
         self.mu_high_combo.currentIndexChanged.connect(self._on_mu_config_changed)
         self.mu_low_combo.currentIndexChanged.connect(self._on_mu_config_changed)
         self.mu_wrap_angle_spin.valueChanged.connect(self._on_mu_config_changed)
         self.mu_swap_btn.clicked.connect(self._swap_mu_channels)
+        self.rmin_spin_mu.valueChanged.connect(self._on_quality_rmin_changed_mu)
+        self.mu_max_spin_mu.valueChanged.connect(self._on_quality_mu_max_changed_mu)
+        self.rmax_spin_mu.valueChanged.connect(self._on_quality_rmax_changed_mu)
+        self.qgap_spin_mu.valueChanged.connect(self._on_quality_gap_timeout_changed_mu)
 
         # ---- 通讯监视器停靠面板 ----
         self.monitor_dock = QDockWidget("通讯监视窗口", self)
@@ -1593,7 +2048,8 @@ class MainWindow(QMainWindow):
                 self.mu_high_combo.setCurrentText(self.fric_high_combo.currentText())
             if self.mu_low_combo.isEnabled():
                 self.mu_low_combo.setCurrentText(self.fric_low_combo.currentText())
-            self.mu_wrap_angle_spin.setValue(self.wrap_angle_spin.value())
+            if self.mu_wrap_angle_spin.isEnabled():
+                self.mu_wrap_angle_spin.setValue(self.wrap_angle_spin.value())
         except Exception:
             pass
         finally:
@@ -1615,7 +2071,8 @@ class MainWindow(QMainWindow):
                 self.fric_high_combo.setCurrentText(self.mu_high_combo.currentText())
             if self.fric_low_combo.isEnabled():
                 self.fric_low_combo.setCurrentText(self.mu_low_combo.currentText())
-            self.wrap_angle_spin.setValue(self.mu_wrap_angle_spin.value())
+            if self.wrap_angle_spin.isEnabled():
+                self.wrap_angle_spin.setValue(self.mu_wrap_angle_spin.value())
         except Exception:
             pass
         finally:
@@ -1642,6 +2099,8 @@ class MainWindow(QMainWindow):
         except Exception:
             self._wrap_angle_rad = 0.0
 
+        self._sync_quality_from_wrap()
+
         self._sync_mu_from_fric()
         self._recalc_friction_buffers()
         try:
@@ -1658,6 +2117,152 @@ class MainWindow(QMainWindow):
         self._sync_fric_from_mu()
         self._on_friction_config_changed()
 
+    def _on_quality_rmin_changed(self, *args):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        self._sync_quality_ui('main')
+        # Rmin only affects quality check; no derived sync needed.
+        try:
+            self._plot_seq = int(getattr(self, '_plot_seq', 0) or 0) + 1
+        except Exception:
+            pass
+        self._plot_dirty = True
+
+    def _on_quality_rmin_changed_mu(self, *args):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        self._sync_quality_ui('mu')
+        self._on_quality_rmin_changed()
+
+    def _on_quality_mu_max_changed(self, *args):
+        if getattr(self, '_quality_syncing', False) or getattr(self, '_quality_ui_syncing', False):
+            return
+        self._quality_last_source = 'mu'
+        self._sync_quality_from_mu()
+        self._sync_quality_ui('main')
+
+    def _on_quality_mu_max_changed_mu(self, *args):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        self._sync_quality_ui('mu')
+        self._on_quality_mu_max_changed()
+
+    def _on_quality_rmax_changed(self, *args):
+        if getattr(self, '_quality_syncing', False) or getattr(self, '_quality_ui_syncing', False):
+            return
+        self._quality_last_source = 'rmax'
+        self._sync_quality_from_rmax()
+        self._sync_quality_ui('main')
+
+    def _on_quality_rmax_changed_mu(self, *args):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        self._sync_quality_ui('mu')
+        self._on_quality_rmax_changed()
+
+    def _on_quality_gap_timeout_changed(self, *args):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        try:
+            self._quality_gap_timeout_s = float(self.qgap_spin.value()) if hasattr(self, 'qgap_spin') else 1.0
+        except Exception:
+            self._quality_gap_timeout_s = 1.0
+        self._sync_quality_ui('main')
+
+    def _on_quality_gap_timeout_changed_mu(self, *args):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        self._sync_quality_ui('mu')
+        self._on_quality_gap_timeout_changed()
+
+    def _sync_quality_ui(self, source: str):
+        if getattr(self, '_quality_ui_syncing', False):
+            return
+        self._quality_ui_syncing = True
+        try:
+            if source == 'main':
+                if hasattr(self, 'rmin_spin_mu'):
+                    self.rmin_spin_mu.setValue(self.rmin_spin.value())
+                if hasattr(self, 'mu_max_spin_mu'):
+                    self.mu_max_spin_mu.setValue(self.mu_max_spin.value())
+                if hasattr(self, 'rmax_spin_mu'):
+                    self.rmax_spin_mu.setValue(self.rmax_spin.value())
+                if hasattr(self, 'qgap_spin_mu'):
+                    self.qgap_spin_mu.setValue(self.qgap_spin.value())
+            elif source == 'mu':
+                if hasattr(self, 'rmin_spin_mu'):
+                    self.rmin_spin.setValue(self.rmin_spin_mu.value())
+                if hasattr(self, 'mu_max_spin_mu'):
+                    self.mu_max_spin.setValue(self.mu_max_spin_mu.value())
+                if hasattr(self, 'rmax_spin_mu'):
+                    self.rmax_spin.setValue(self.rmax_spin_mu.value())
+                if hasattr(self, 'qgap_spin_mu'):
+                    self.qgap_spin.setValue(self.qgap_spin_mu.value())
+        finally:
+            self._quality_ui_syncing = False
+
+    def _sync_quality_from_wrap(self):
+        if getattr(self, '_quality_syncing', False):
+            return
+        if getattr(self, '_quality_last_source', 'mu') == 'rmax':
+            self._sync_quality_from_rmax()
+        else:
+            self._sync_quality_from_mu()
+
+    def _sync_quality_from_mu(self):
+        if getattr(self, '_quality_syncing', False):
+            return
+        self._quality_syncing = True
+        try:
+            mu_max = float(self.mu_max_spin.value()) if hasattr(self, 'mu_max_spin') else 0.0
+        except Exception:
+            mu_max = 0.0
+        try:
+            theta = float(getattr(self, '_wrap_angle_rad', 0.0) or 0.0)
+        except Exception:
+            theta = 0.0
+        try:
+            rmax = math.exp(mu_max * theta) if theta > 0 else 1.0
+        except Exception:
+            rmax = 1.0
+        try:
+            if hasattr(self, 'rmax_spin'):
+                self.rmax_spin.setValue(float(rmax))
+        finally:
+            self._quality_syncing = False
+        self._sync_quality_ui('main')
+
+    def _sync_quality_from_rmax(self):
+        if getattr(self, '_quality_syncing', False):
+            return
+        self._quality_syncing = True
+        try:
+            rmax = float(self.rmax_spin.value()) if hasattr(self, 'rmax_spin') else 1.0
+        except Exception:
+            rmax = 1.0
+        try:
+            theta = float(getattr(self, '_wrap_angle_rad', 0.0) or 0.0)
+        except Exception:
+            theta = 0.0
+        if theta > 0 and rmax > 0:
+            try:
+                mu_max = math.log(rmax) / theta
+            except Exception:
+                mu_max = 0.0
+        else:
+            mu_max = 0.0
+        try:
+            if hasattr(self, 'mu_max_spin'):
+                self.mu_max_spin.setValue(float(mu_max))
+        finally:
+            self._quality_syncing = False
+        self._sync_quality_ui('main')
+
+    def _get_quality_gap_timeout(self) -> float:
+        try:
+            return float(getattr(self, '_quality_gap_timeout_s', 1.0) or 1.0)
+        except Exception:
+            return 1.0
     def _calc_fric_mu(self, high_v, low_v):
         try:
             if high_v is None or low_v is None:
@@ -1878,10 +2483,18 @@ class MainWindow(QMainWindow):
         old_size = int(getattr(self, '_buf_size', 0) or 0)
         if new_size <= 0 or new_size == old_size:
             return
-        xs, ys_map, xs_wall = self._snapshot_ring(include_wall=True)
-        self._alloc_ring_buffers(new_size, list(self.channel_names), keep_last=True, xs=xs, ys_map=ys_map, xs_wall=xs_wall)
+        xs, ys_map, xs_wall, qf_vals = self._snapshot_ring(include_wall=True, include_quality=True)
+        self._alloc_ring_buffers(
+            new_size,
+            list(self.channel_names),
+            keep_last=True,
+            xs=xs,
+            ys_map=ys_map,
+            xs_wall=xs_wall,
+            qf_vals=qf_vals,
+        )
 
-    def _alloc_ring_buffers(self, size: int, channel_names: list, keep_last: bool = False, xs=None, ys_map=None, xs_wall=None):
+    def _alloc_ring_buffers(self, size: int, channel_names: list, keep_last: bool = False, xs=None, ys_map=None, xs_wall=None, qf_vals=None):
         """分配环形缓冲区。
 
         当 keep_last=True 时，将最后 min(len(xs), size) 个样本复制到新缓冲区。
@@ -1912,6 +2525,10 @@ class MainWindow(QMainWindow):
             self._mu_buf = [None] * size
             self._fric_plot_y = None
             self._mu_plot_y = None
+        if np is not None:
+            self._qf_buf = np.full(size, np.nan, dtype=float)
+        else:
+            self._qf_buf = [None] * size
 
         self._val_buf_by_channel = {}
         self._plot_y_by_channel = {}
@@ -1955,6 +2572,19 @@ class MainWindow(QMainWindow):
                     else:
                         self._val_buf_by_channel[name][:k] = list(tail_y)
 
+                if qf_vals:
+                    tail_qf = qf_vals[-k:] if len(qf_vals) >= k else list(qf_vals)
+                    if len(tail_qf) < k:
+                        tail_qf = ([None] * (k - len(tail_qf))) + list(tail_qf)
+                    if np is not None:
+                        try:
+                            arr_qf = np.asarray([(np.nan if v is None else float(v)) for v in tail_qf], dtype=float)
+                            self._qf_buf[:k] = arr_qf
+                        except Exception:
+                            pass
+                    else:
+                        self._qf_buf[:k] = list(tail_qf)
+
                 # 对保留样本重新计算摩擦相关缓冲
                 high_name = (getattr(self, "_fric_high_name", "") or "").strip()
                 low_name = (getattr(self, "_fric_low_name", "") or "").strip()
@@ -1987,12 +2617,16 @@ class MainWindow(QMainWindow):
                 self._buf_count = k
                 self._buf_idx = k % size
 
-    def _snapshot_ring(self, include_wall: bool = False):
+    def _snapshot_ring(self, include_wall: bool = False, include_quality: bool = False):
         """将环形缓冲区快照为按时间排序的 Python 列表（用于调整大小/导出）。"""
         count = int(getattr(self, '_buf_count', 0) or 0)
         size = int(getattr(self, '_buf_size', 0) or 0)
         if count <= 0 or size <= 0 or self._ts_buf is None:
             if include_wall:
+                if include_quality:
+                    return [], {}, [], []
+                return [], {}, []
+            if include_quality:
                 return [], {}, []
             return [], {}
         idx = int(getattr(self, '_buf_idx', 0) or 0)
@@ -2046,9 +2680,260 @@ class MainWindow(QMainWindow):
                 else:
                     ys = list(buf[idx:]) + list(buf[:idx])
             ys_map[name] = ys
+        qf_vals = []
+        if include_quality and self._qf_buf is not None:
+            buf = self._qf_buf
+            if np is not None:
+                if count < size:
+                    arr = buf[:count]
+                else:
+                    arr = np.concatenate((buf[idx:], buf[:idx]))
+                qf_vals = [None if (not np.isfinite(v)) else float(v) for v in arr]
+            else:
+                if count < size:
+                    qf_vals = list(buf[:count])
+                else:
+                    qf_vals = list(buf[idx:]) + list(buf[:idx])
         if include_wall:
+            if include_quality:
+                return xs, ys_map, xs_wall, qf_vals
             return xs, ys_map, xs_wall
+        if include_quality:
+            return xs, ys_map, qf_vals
         return xs, ys_map
+
+    def _safe_float(self, v):
+        try:
+            fv = float(v)
+        except Exception:
+            return None
+        try:
+            if not math.isfinite(fv):
+                return None
+        except Exception:
+            pass
+        return fv
+
+    def _row_data_ok(self, row: dict) -> bool:
+        for name in self.channel_names:
+            if self._safe_float(row.get(name, None)) is None:
+                return False
+        return True
+
+    def _sanitize_row(self, row: dict) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for name in self.channel_names:
+            out[name] = self._safe_float(row.get(name, None))
+        return out
+
+    def _get_quality_params(self) -> Tuple[float, float]:
+        try:
+            rmin = float(self.rmin_spin.value()) if hasattr(self, "rmin_spin") else 1.01
+        except Exception:
+            rmin = 1.01
+        try:
+            rmax = float(self.rmax_spin.value()) if hasattr(self, "rmax_spin") else 1.0
+        except Exception:
+            rmax = 1.0
+        return rmin, rmax
+
+    def _calc_quality_flag(self, row: dict, data_ok: bool) -> int:
+        if not data_ok:
+            return 0
+
+        high_name = (getattr(self, "_fric_high_name", "") or "").strip()
+        low_name = (getattr(self, "_fric_low_name", "") or "").strip()
+        if not high_name or not low_name:
+            return 0
+
+        high_v = self._safe_float(row.get(high_name, None))
+        low_v = self._safe_float(row.get(low_name, None))
+        if high_v is None or low_v is None:
+            return 0
+
+        if high_v <= 0 or low_v <= 0:
+            return 0
+
+        rmin, rmax = self._get_quality_params()
+        try:
+            ratio = float(high_v) / float(low_v)
+        except Exception:
+            return 0
+        if ratio < rmin or ratio > rmax:
+            return 0
+
+        if getattr(self, "motor_mode", None) == 0:
+            last_t = getattr(self, "_last_tension_setpoint", None)
+            try:
+                last_t = float(last_t) if last_t is not None else None
+            except Exception:
+                last_t = None
+            if last_t is not None and last_t > 0:
+                tmin = 0.05 * last_t
+                if high_v < tmin or low_v < tmin:
+                    return 0
+
+        return 1
+
+    def _commit_sample(self, mono_ts: float, wall_ts: float, row: dict, quality_flag: int):
+        # Compute relative time based on the sample's monotonic timestamp.
+        if self._t0_mono_ts is None:
+            self._t0_mono_ts = float(mono_ts)
+        pause_accum = float(getattr(self, '_mono_pause_accum', 0.0) or 0.0)
+        rel_ts = float(float(mono_ts) - float(self._t0_mono_ts) - pause_accum)
+        if rel_ts < 0.0:
+            rel_ts = 0.0
+
+        self._last_sample_rel_ts = rel_ts
+        self._last_sample_mono_ts = float(mono_ts)
+
+        size = int(getattr(self, '_buf_size', 0) or 0)
+        if size <= 0:
+            return
+        i = int(getattr(self, '_buf_idx', 0) or 0) % size
+
+        if np is not None:
+            try:
+                self._ts_buf[i] = float(rel_ts)
+            except Exception:
+                self._ts_buf[i] = np.nan
+            try:
+                if self._ts_wall_buf is not None:
+                    self._ts_wall_buf[i] = float(wall_ts)
+            except Exception:
+                try:
+                    if self._ts_wall_buf is not None:
+                        self._ts_wall_buf[i] = np.nan
+                except Exception:
+                    pass
+            for name in self.channel_names:
+                v = row.get(name, None)
+                try:
+                    self._val_buf_by_channel[name][i] = (np.nan if v is None else float(v))
+                except Exception:
+                    self._val_buf_by_channel[name][i] = np.nan
+            try:
+                if self._qf_buf is not None:
+                    self._qf_buf[i] = float(quality_flag)
+            except Exception:
+                pass
+        else:
+            self._ts_buf[i] = rel_ts
+            if self._ts_wall_buf is not None:
+                self._ts_wall_buf[i] = wall_ts
+            for name in self.channel_names:
+                self._val_buf_by_channel[name][i] = row.get(name, None)
+            try:
+                if self._qf_buf is not None:
+                    self._qf_buf[i] = int(quality_flag)
+            except Exception:
+                pass
+
+        # Update derived buffers (friction/mu) using the committed row values.
+        self._update_friction_buffers_at_index(i, row)
+
+        try:
+            if getattr(self, "_log_db_path", ""):
+                row_for_log = {name: row.get(name, None) for name in self.channel_names}
+                row_for_log[self._quality_flag_name] = int(quality_flag)
+                self._data_logger.append(wall_ts, row_for_log)
+        except Exception:
+            pass
+
+        self._buf_idx = (i + 1) % size
+        if int(getattr(self, '_buf_count', 0) or 0) < size:
+            self._buf_count += 1
+
+        self._plot_seq = int(getattr(self, '_plot_seq', 0) or 0) + 1
+        self._plot_dirty = True
+
+    def _trigger_comm_gap_stop(self):
+        if getattr(self, "_quality_gap_triggered", False):
+            return
+        self._quality_gap_triggered = True
+        try:
+            self.on_motor_estop()
+        except Exception:
+            pass
+        try:
+            self.stop_acquire()
+        except Exception:
+            pass
+        try:
+            QMessageBox.warning(self, "通信异常", "连续通信丢包或解析失败超过 1 秒，已急停并停止采集。")
+        except Exception:
+            pass
+
+    def _process_quality_sample(self, mono_ts: float, wall_ts: float, row: dict):
+        data_ok = self._row_data_ok(row)
+
+        if not data_ok:
+            if self._quality_gap_start_mono is None:
+                self._quality_gap_start_mono = float(mono_ts)
+                self._quality_gap_triggered = False
+
+            if (float(mono_ts) - float(self._quality_gap_start_mono)) >= self._get_quality_gap_timeout():
+                self._trigger_comm_gap_stop()
+                return
+
+            pending = self._quality_gap_pending
+            pending.append({"mono": mono_ts, "wall": wall_ts, "row": row})
+
+            if self._quality_gap_hold_mode:
+                hold_row = self._last_valid_row or self._sanitize_row(row)
+                self._commit_sample(mono_ts, wall_ts, hold_row, 0)
+                return
+
+            if len(pending) > 3:
+                hold_row = self._last_valid_row
+                if hold_row is None:
+                    for s in pending:
+                        self._commit_sample(s["mono"], s["wall"], self._sanitize_row(s["row"]), 0)
+                else:
+                    for s in pending:
+                        self._commit_sample(s["mono"], s["wall"], hold_row, 0)
+                pending.clear()
+                self._quality_gap_hold_mode = True
+            return
+
+        # data ok: flush pending gaps if any
+        if self._quality_gap_start_mono is not None:
+            self._quality_gap_start_mono = None
+            self._quality_gap_triggered = False
+        self._quality_gap_hold_mode = False
+
+        pending = self._quality_gap_pending
+        if pending:
+            m = len(pending)
+            if self._last_valid_row is not None and m <= 3:
+                last_row = self._last_valid_row
+                cur_row = self._sanitize_row(row)
+                for idx, s in enumerate(pending, start=1):
+                    frac = float(idx) / float(m + 1)
+                    interp_row: Dict[str, Optional[float]] = {}
+                    for name in self.channel_names:
+                        v0 = last_row.get(name, None)
+                        v1 = cur_row.get(name, None)
+                        if v0 is None or v1 is None:
+                            v = v0 if v0 is not None else v1
+                        else:
+                            v = float(v0) + (float(v1) - float(v0)) * frac
+                        interp_row[name] = v
+                    self._commit_sample(s["mono"], s["wall"], interp_row, 0)
+            else:
+                hold_row = self._last_valid_row
+                for s in pending:
+                    if hold_row is None:
+                        self._commit_sample(s["mono"], s["wall"], self._sanitize_row(s["row"]), 0)
+                    else:
+                        self._commit_sample(s["mono"], s["wall"], hold_row, 0)
+            pending.clear()
+            self._quality_gap_hold_mode = False
+
+        clean_row = self._sanitize_row(row)
+        qf = self._calc_quality_flag(clean_row, True)
+        self._commit_sample(mono_ts, wall_ts, clean_row, qf)
+        self._last_valid_row = clean_row
 
     # ---------- 监视 ----------
     def append_monitor(self, s: str):
@@ -2543,6 +3428,10 @@ class MainWindow(QMainWindow):
         val = self._parse_number_text(self.motor_tension_edit.text(), "张力(g)")
         if val is None:
             return
+        try:
+            self._last_tension_setpoint = float(val)
+        except Exception:
+            pass
         self._send_motor_cmd(f"F {val}")
 
     def on_motor_pid(self):
@@ -2684,6 +3573,11 @@ class MainWindow(QMainWindow):
         # 重置暂停补偿
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
+        self._quality_gap_pending = []
+        self._quality_gap_hold_mode = False
+        self._quality_gap_start_mono = None
+        self._quality_gap_triggered = False
+        self._last_valid_row = None
 
         self.plot.clear()
         self.plot.addLegend()
@@ -2742,16 +3636,7 @@ class MainWindow(QMainWindow):
 
     @Slot(float, dict)
     def on_data_ready(self, ts: float, row: dict):
-        # 将输入时间戳转换为平滑的相对单调时间基准。
         mono_now = time.monotonic()
-        if self._t0_mono_ts is None:
-            self._t0_mono_ts = float(mono_now)
-        pause_accum = float(getattr(self, '_mono_pause_accum', 0.0) or 0.0)
-        rel_ts = float(mono_now - float(self._t0_mono_ts) - pause_accum)
-        if rel_ts < 0.0:
-            rel_ts = 0.0
-        self._last_sample_rel_ts = rel_ts
-        self._last_sample_mono_ts = float(mono_now)
         try:
             wall_ts = float(ts) if ts is not None else time.time()
         except Exception:
@@ -2775,53 +3660,7 @@ class MainWindow(QMainWindow):
         if want and want != int(getattr(self, '_buf_size', 0) or 0):
             self._resize_ring_buffers(want)
 
-        size = int(getattr(self, '_buf_size', 0) or 0)
-        if size <= 0:
-            return
-        i = int(getattr(self, '_buf_idx', 0) or 0) % size
-
-        # 追加到环形缓冲区（数组大小 == 当前窗口最大点数）
-        if np is not None:
-            try:
-                self._ts_buf[i] = float(rel_ts)
-            except Exception:
-                self._ts_buf[i] = np.nan
-            try:
-                if self._ts_wall_buf is not None:
-                    self._ts_wall_buf[i] = float(wall_ts)
-            except Exception:
-                try:
-                    if self._ts_wall_buf is not None:
-                        self._ts_wall_buf[i] = np.nan
-                except Exception:
-                    pass
-            for name in self.channel_names:
-                v = row.get(name, None)
-                try:
-                    self._val_buf_by_channel[name][i] = (np.nan if v is None else float(v))
-                except Exception:
-                    self._val_buf_by_channel[name][i] = np.nan
-        else:
-            self._ts_buf[i] = rel_ts
-            if self._ts_wall_buf is not None:
-                self._ts_wall_buf[i] = wall_ts
-            for name in self.channel_names:
-                self._val_buf_by_channel[name][i] = row.get(name, None)
-
-        # 更新派生的摩擦相关缓冲
-        self._update_friction_buffers_at_index(i, row)
-        try:
-            if getattr(self, "_log_db_path", ""):
-                self._data_logger.append(wall_ts, row)
-        except Exception:
-            pass
-
-        self._buf_idx = (i + 1) % size
-        if int(getattr(self, '_buf_count', 0) or 0) < size:
-            self._buf_count += 1
-
-        self._plot_seq = int(getattr(self, '_plot_seq', 0) or 0) + 1
-        self._plot_dirty = True
+        self._process_quality_sample(mono_now, wall_ts, row)
 
 
     def update_plot(self):
@@ -3186,6 +4025,11 @@ class MainWindow(QMainWindow):
         # 重置时间轴的暂停补偿
         self._mono_pause_accum = 0.0
         self._mono_pause_start = None
+        self._quality_gap_pending = []
+        self._quality_gap_hold_mode = False
+        self._quality_gap_start_mono = None
+        self._quality_gap_triggered = False
+        self._last_valid_row = None
         self.channel_names = [c.name for c in enabled_channels]
         self._log_units = [self._last_unit_map.get(c.name, "") for c in enabled_channels]
         self.init_curves(self.channel_names)
@@ -3215,6 +4059,11 @@ class MainWindow(QMainWindow):
         self.is_acquiring = False
         self.is_paused = False
         self._mono_pause_start = None
+        self._quality_gap_pending = []
+        self._quality_gap_hold_mode = False
+        self._quality_gap_start_mono = None
+        self._quality_gap_triggered = False
+        self._last_valid_row = None
         self.pause_btn.setText("暂停")
         self.pause_btn.setEnabled(False)
         self.acquire_btn.setText("开始采集")
@@ -3275,10 +4124,15 @@ class MainWindow(QMainWindow):
         try:
             if not channel_names:
                 return
-            path = self._data_logger.start_session(channel_names, channel_units or [])
+            log_names = list(channel_names)
+            log_units = list(channel_units or [])
+            if self._quality_flag_name not in log_names:
+                log_names.append(self._quality_flag_name)
+                log_units.append("")
+            path = self._data_logger.start_session(log_names, log_units)
             self._log_db_path = path
-            self._log_channels = list(channel_names)
-            self._log_units = list(channel_units or [])
+            self._log_channels = list(log_names)
+            self._log_units = list(log_units)
         except Exception:
             self._log_db_path = ""
             self._log_channels = []
@@ -3330,7 +4184,7 @@ class MainWindow(QMainWindow):
             return "无量纲"
         return f"{u}【单位】"
 
-    def _export_xlsx_from_ring(self, path: str, xs, ys_map, xs_wall):
+    def _export_xlsx_from_ring(self, path: str, xs, ys_map, xs_wall, qf_vals=None):
         wb = Workbook()
         ws_all = wb.active
         ws_all.title = "All"
@@ -3341,7 +4195,7 @@ class MainWindow(QMainWindow):
             unit = units[idx] if idx < len(units) else ""
             unit_label = self._unit_label(unit)
             headers.append(f"{name}({unit_label})" if unit_label else name)
-        headers += ["摩擦力(N【牛】)", "摩擦系数"]
+        headers += ["摩擦力(N【牛】)", "摩擦系数", self._quality_flag_label]
         for i, h in enumerate(headers, start=1):
             ws_all.cell(row=1, column=i, value=h)
 
@@ -3379,6 +4233,11 @@ class MainWindow(QMainWindow):
             fric_n, mu = self._calc_fric_mu(high_v, low_v)
             ws_all.cell(row=r, column=col_idx, value=fric_n)
             ws_all.cell(row=r, column=col_idx + 1, value=mu)
+            col_idx += 2
+
+            # 质量标志
+            qf_v = qf_vals[r - 2] if (qf_vals is not None and (r - 2) < len(qf_vals)) else None
+            ws_all.cell(row=r, column=col_idx, value=qf_v)
 
         # 每通道工作表（仅小数据量）
         for i, name in enumerate(self.channel_names):
@@ -3395,13 +4254,26 @@ class MainWindow(QMainWindow):
                 v = vals[r] if r < len(vals) else None
                 ws.cell(row=r + 2, column=2, value=v)
 
+        if qf_vals is not None:
+            ws_q = wb.create_sheet(title=self._safe_sheet_name(self._quality_flag_name))
+            ws_q.cell(row=1, column=1, value="Time")
+            ws_q.cell(row=1, column=2, value=self._quality_flag_label)
+            for r in range(nrows):
+                wall_ts = xs_wall[r] if xs_wall and r < len(xs_wall) else None
+                t_str = self._format_export_time(wall_ts, xs[r])
+                ws_q.cell(row=r + 2, column=1, value=t_str)
+                qv = qf_vals[r] if r < len(qf_vals) else None
+                ws_q.cell(row=r + 2, column=2, value=qv)
+
         # 摩擦力工作表
         ws_f = wb.create_sheet(title="摩擦力")
         ws_f.cell(row=1, column=1, value="Time")
         ws_f.cell(row=1, column=2, value="摩擦力(N【牛】)")
+        ws_f.cell(row=1, column=3, value=self._quality_flag_label)
         ws_mu = wb.create_sheet(title="摩擦系数")
         ws_mu.cell(row=1, column=1, value="Time")
         ws_mu.cell(row=1, column=2, value="摩擦系数")
+        ws_mu.cell(row=1, column=3, value=self._quality_flag_label)
         for r, rel_ts in enumerate(xs, start=2):
             wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
@@ -3418,15 +4290,18 @@ class MainWindow(QMainWindow):
                 fric_n, mu = self._calc_fric_mu(hv, lv)
             ws_f.cell(row=r, column=1, value=t_str)
             ws_f.cell(row=r, column=2, value=fric_n)
+            qf_v = qf_vals[r - 2] if (qf_vals is not None and (r - 2) < len(qf_vals)) else None
+            ws_f.cell(row=r, column=3, value=qf_v)
             ws_mu.cell(row=r, column=1, value=t_str)
             ws_mu.cell(row=r, column=2, value=mu)
+            ws_mu.cell(row=r, column=3, value=qf_v)
 
         for ws in wb.worksheets:
             self._autosize_sheet(ws)
 
         wb.save(path)
 
-    def _export_xlsx_from_db(self, db_path: str, path: str):
+    def _export_xlsx_from_db(self, db_path: str, path: str, progress_cb=None, progress_ctx=None):
         # 刷新排队行（尽力而为）
         try:
             if self._data_logger:
@@ -3435,6 +4310,20 @@ class MainWindow(QMainWindow):
             pass
 
         conn = sqlite3.connect(db_path)
+        total_rows = None
+        if progress_cb:
+            try:
+                total_rows = conn.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+                if total_rows is None:
+                    total_rows = 0
+            except Exception:
+                total_rows = None
+            try:
+                if total_rows is not None:
+                    total_rows = max(1, int(total_rows))
+                    progress_cb(progress_ctx, 0, total_rows)
+            except Exception:
+                pass
         try:
             try:
                 cur = conn.execute("SELECT idx, name, unit FROM channels ORDER BY idx")
@@ -3455,15 +4344,17 @@ class MainWindow(QMainWindow):
             ws_all = wb.create_sheet("All")
             headers = ["Time"]
             for idx, name in enumerate(channel_names):
+                if name == self._quality_flag_name:
+                    continue
                 unit = channel_units[idx] if idx < len(channel_units) else ""
                 unit_label = self._unit_label(unit)
                 headers.append(f"{name}({unit_label})" if unit_label else name)
-            headers += ["摩擦力(N【牛】)", "摩擦系数"]
+            headers += ["摩擦力(N【牛】)", "摩擦系数", self._quality_flag_label]
             ws_all.append(headers)
             ws_f = wb.create_sheet("摩擦力")
-            ws_f.append(["Time", "摩擦力(N【牛】)"])
+            ws_f.append(["Time", "摩擦力(N【牛】)", self._quality_flag_label])
             ws_mu = wb.create_sheet("摩擦系数")
-            ws_mu.append(["Time", "摩擦系数"])
+            ws_mu.append(["Time", "摩擦系数", self._quality_flag_label])
 
             hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
             lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
@@ -3472,6 +4363,7 @@ class MainWindow(QMainWindow):
             lo_idx = name_to_idx.get(lo_name, None)
 
             cur = conn.execute(query)
+            done_rows = 0
             while True:
                 rows = cur.fetchmany(1000)
                 if not rows:
@@ -3483,16 +4375,26 @@ class MainWindow(QMainWindow):
                     high_v = vals[hi_idx] if (hi_idx is not None and hi_idx < len(vals)) else None
                     low_v = vals[lo_idx] if (lo_idx is not None and lo_idx < len(vals)) else None
                     row_out = [t_str]
+                    qf_val = None
                     for idx, name in enumerate(channel_names):
                         v = vals[idx] if idx < len(vals) else None
+                        if name == self._quality_flag_name:
+                            qf_val = v
+                            continue
                         row_out.append(v)
 
                     fric_n, mu = self._calc_fric_mu(high_v, low_v)
-                    row_out += [fric_n, mu]
+                    row_out += [fric_n, mu, qf_val]
                     ws_all.append(row_out)
-                    ws_f.append([t_str, fric_n])
-                    ws_mu.append([t_str, mu])
+                    ws_f.append([t_str, fric_n, qf_val])
+                    ws_mu.append([t_str, mu, qf_val])
 
+                done_rows += len(rows)
+                if progress_cb and total_rows is not None:
+                    try:
+                        progress_cb(progress_ctx, done_rows, total_rows)
+                    except Exception:
+                        pass
             wb.save(path)
         finally:
             conn.close()
@@ -3519,28 +4421,76 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "数据库文件不存在。")
             return
 
-        base = os.path.splitext(os.path.basename(db_path))[0]
-        out_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出为 XLSX",
-            os.path.join(data_dir, f"{base}.xlsx"),
-            "Excel Files (*.xlsx)"
-        )
-        if not out_path:
-            return
-        if not out_path.lower().endswith(".xlsx"):
-            out_path += ".xlsx"
-
-        try:
-            self._export_xlsx_from_db(db_path, out_path)
-            self.set_status(f"已保存：{out_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出历史数据库失败：\n{e}")
+        self.queue_export_db_paths([db_path])
 
     def open_history_dialog(self):
         data_dir = os.path.join(os.getcwd(), "data_logs")
         dlg = HistoryDbDialog(self, data_dir, self._export_history_db_path)
         dlg.exec()
+
+    def _get_export_queue_dialog(self):
+        if not hasattr(self, "_export_queue_dialog") or self._export_queue_dialog is None:
+            self._export_queue_dialog = ExportQueueDialog(self, self._export_xlsx_from_db)
+        return self._export_queue_dialog
+
+    def open_export_queue_dialog(self):
+        dlg = self._get_export_queue_dialog()
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+
+    def queue_export_db_paths(self, db_paths: List[str]):
+        if not db_paths:
+            return
+
+        if len(db_paths) == 1:
+            db_path = db_paths[0]
+            base = os.path.splitext(os.path.basename(db_path))[0]
+            default_dir = os.path.dirname(db_path) or os.path.join(os.getcwd(), "data_logs")
+            out_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "导出为 XLSX",
+                os.path.join(default_dir, f"{base}.xlsx"),
+                "Excel Files (*.xlsx)"
+            )
+            if not out_path:
+                return
+            if not out_path.lower().endswith(".xlsx"):
+                out_path += ".xlsx"
+            tasks = [{"db_path": db_path, "out_path": out_path}]
+            dlg = self._get_export_queue_dialog()
+            dlg.show()
+            try:
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+            dlg.enqueue_exports(tasks)
+            return
+
+        default_dir = os.path.dirname(db_paths[0]) or os.path.join(os.getcwd(), "data_logs")
+        zip_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出压缩包",
+            os.path.join(default_dir, "history_databases.zip"),
+            "Zip Files (*.zip)"
+        )
+        if not zip_path:
+            return
+        if not zip_path.lower().endswith(".zip"):
+            zip_path += ".zip"
+        tasks = [{"db_path": p, "out_path": ""} for p in db_paths]
+        dlg = self._get_export_queue_dialog()
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+        dlg.enqueue_exports(tasks, zip_path=zip_path)
 
     def _build_history_menu(self):
         if not hasattr(self, "hist_menu") or self.hist_menu is None:
@@ -3550,8 +4500,11 @@ class MainWindow(QMainWindow):
         act_refresh = self.hist_menu.addAction("刷新历史数据库")
         act_refresh.triggered.connect(self._build_history_menu)
 
-        act_pick = self.hist_menu.addAction("选择历史数据库导出...")
+        act_pick = self.hist_menu.addAction("管理数据库")
         act_pick.triggered.connect(self.open_history_dialog)
+        act_queue = self.hist_menu.addAction("导出队列")
+        act_queue.triggered.connect(self.open_export_queue_dialog)
+
 
         self.hist_menu.addSeparator()
 
@@ -3597,26 +4550,8 @@ class MainWindow(QMainWindow):
         if not db_path or not os.path.isfile(db_path):
             QMessageBox.warning(self, "提示", "数据库文件不存在。")
             return
-        data_dir = os.path.dirname(db_path)
-        base = os.path.splitext(os.path.basename(db_path))[0]
-        out_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出为 XLSX",
-            os.path.join(data_dir, f"{base}.xlsx"),
-            "Excel Files (*.xlsx)"
-        )
-        if not out_path:
-            return
-        if not out_path.lower().endswith(".xlsx"):
-            out_path += ".xlsx"
+        self.queue_export_db_paths([db_path])
 
-        try:
-            self._export_xlsx_from_db(db_path, out_path)
-            self.set_status(f"已保存：{out_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", f"导出历史数据库失败：\n{e}")
-
-    # ---------- 导出 ----------
     def save_xlsx(self):
         db_path = self._log_db_path if getattr(self, "_log_db_path", "") else ""
         use_db = self._db_has_data(db_path)
@@ -3625,7 +4560,7 @@ class MainWindow(QMainWindow):
         ys_map = {}
         xs_wall = []
         if not use_db:
-            xs, ys_map, xs_wall = self._snapshot_ring(include_wall=True)
+            xs, ys_map, xs_wall, qf_vals = self._snapshot_ring(include_wall=True, include_quality=True)
             if not xs or not self.channel_names:
                 QMessageBox.information(self, "提示", "当前没有可保存的数据。请先开始采集。")
                 return
@@ -3640,7 +4575,7 @@ class MainWindow(QMainWindow):
             if use_db:
                 self._export_xlsx_from_db(db_path, path)
             else:
-                self._export_xlsx_from_ring(path, xs, ys_map, xs_wall)
+                self._export_xlsx_from_ring(path, xs, ys_map, xs_wall, qf_vals=qf_vals)
             self.set_status(f"已保存：{path}")
         except Exception as e:
             QMessageBox.critical(self, "\u4fdd\u5b58\u5931\u8d25", f"\u4fdd\u5b58 xlsx \u5931\u8d25\uff1a\\n{e}")
