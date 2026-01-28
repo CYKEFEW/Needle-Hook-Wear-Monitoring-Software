@@ -4425,8 +4425,21 @@ class MainWindow(QMainWindow):
 
     def open_history_dialog(self):
         data_dir = os.path.join(os.getcwd(), "data_logs")
-        dlg = HistoryDbDialog(self, data_dir, self._export_history_db_path)
-        dlg.exec()
+        if not hasattr(self, "_history_db_dialog") or self._history_db_dialog is None:
+            self._history_db_dialog = HistoryDbDialog(self, data_dir, self._export_history_db_path)
+        else:
+            try:
+                self._history_db_dialog._data_dir = data_dir
+                self._history_db_dialog.reload()
+            except Exception:
+                pass
+        dlg = self._history_db_dialog
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
 
     def _get_export_queue_dialog(self):
         if not hasattr(self, "_export_queue_dialog") or self._export_queue_dialog is None:
