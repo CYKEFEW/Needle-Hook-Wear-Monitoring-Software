@@ -448,7 +448,7 @@ class ExportQueueDialog(QDialog):
         if total_bytes <= 0:
             return 2.0
         size_mb = float(total_bytes) / (1024.0 * 1024.0)
-        seconds = size_mb * 0.4 * 5.0
+        seconds = size_mb * 0.4 * 20.0
         if seconds < 1.0:
             seconds = 1.0
         if seconds > 60.0:
