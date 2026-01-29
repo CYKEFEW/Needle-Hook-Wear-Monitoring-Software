@@ -6,6 +6,7 @@ import concurrent.futures
 import os
 import sqlite3
 import time
+import threading
 import tempfile
 import zipfile
 import unicodedata
@@ -253,13 +254,39 @@ class ExportQueueWorker(QThread):
         self._export_func = export_func
         self._max_workers = max(1, int(max_workers))
         self._zip_path = zip_path or ""
+        self._cancel_event = threading.Event()
+        self._pause_event = threading.Event()
+
+    def cancel(self):
+        try:
+            self._cancel_event.set()
+        except Exception:
+            pass
+
+    def set_paused(self, paused: bool):
+        try:
+            if paused:
+                self._pause_event.set()
+            else:
+                self._pause_event.clear()
+        except Exception:
+            pass
 
     def run(self):
         exported = []
         failed = []
         zip_path = self._zip_path
 
+        def _wait_if_paused():
+            while self._pause_event.is_set():
+                if self._cancel_event.is_set():
+                    raise RuntimeError('cancelled')
+                time.sleep(0.1)
+
         def progress_cb(ctx, done, total):
+            _wait_if_paused()
+            if self._cancel_event.is_set():
+                raise RuntimeError('cancelled')
             try:
                 total_i = int(total) if total is not None else -1
             except Exception:
@@ -271,51 +298,64 @@ class ExportQueueWorker(QThread):
             self.progress.emit(str(ctx), done_i, total_i)
 
         def run_one(task):
-            db_path = task.get("db_path") or ""
-            out_path = task.get("out_path") or ""
+            if self._cancel_event.is_set():
+                return False, (task.get('db_path') or '', '')
+            db_path = task.get('db_path') or ''
+            out_path = task.get('out_path') or ''
             if not db_path:
-                return False, ("", "")
-            self.status.emit(db_path, "导出中")
+                return False, ('', '')
+            self.status.emit(db_path, '导出中')
             try:
+                _wait_if_paused()
+                if self._cancel_event.is_set():
+                    return False, (db_path, '')
                 self._export_func(db_path, out_path, progress_cb=progress_cb, progress_ctx=db_path)
-                self.status.emit(db_path, "完成")
+                if self._cancel_event.is_set():
+                    return False, (db_path, '')
+                self.status.emit(db_path, '完成')
                 return True, (db_path, out_path)
             except Exception:
-                self.status.emit(db_path, "失败")
-                return False, (db_path, "")
+                self.status.emit(db_path, '失败')
+                return False, (db_path, '')
 
         tmp_ctx = None
         if zip_path:
             tmp_ctx = tempfile.TemporaryDirectory()
             for task in self._tasks:
-                if task.get("out_path"):
+                if task.get('out_path'):
                     continue
-                db_path = task.get("db_path") or ""
+                db_path = task.get('db_path') or ''
                 base = os.path.splitext(os.path.basename(db_path))[0]
-                task["out_path"] = os.path.join(tmp_ctx.name, base + ".xlsx")
+                task['out_path'] = os.path.join(tmp_ctx.name, base + '.xlsx')
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as ex:
-                futures = [ex.submit(run_one, task) for task in self._tasks]
+                futures = []
+                for task in self._tasks:
+                    if self._cancel_event.is_set():
+                        break
+                    futures.append(ex.submit(run_one, task))
                 for fut in concurrent.futures.as_completed(futures):
+                    if self._cancel_event.is_set():
+                        break
                     ok, payload = fut.result()
                     if ok:
                         exported.append(payload)
                     else:
                         failed.append(payload[0])
 
-            if zip_path and exported:
-                self.phase.emit("打包中")
+            if zip_path and exported and (not self._cancel_event.is_set()):
+                self.phase.emit('打包中')
                 try:
-                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                         for db_path, out_path in exported:
                             if not out_path:
                                 continue
                             arc_name = os.path.basename(out_path)
                             zf.write(out_path, arcname=arc_name)
-                    self.phase.emit("打包完成")
+                    self.phase.emit('打包完成')
                 except Exception:
-                    self.phase.emit("打包失败")
+                    self.phase.emit('打包失败')
         finally:
             try:
                 if tmp_ctx is not None:
@@ -333,16 +373,16 @@ class ExportQueueDialog(QDialog):
         self._tasks = []
         self._task_info = {}
         self._worker = None
-        self._zip_path = ""
+        self._zip_path = ''
         self._start_ts = None
 
-        self.setWindowTitle("导出队列")
+        self.setWindowTitle('导出队列')
         self.resize(720, 480)
 
         root = QVBoxLayout(self)
 
         top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("最大线程："))
+        top_row.addWidget(QLabel('最大线程：'))
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 64)
         self.thread_spin.setValue(8)
@@ -350,8 +390,8 @@ class ExportQueueDialog(QDialog):
         top_row.addStretch(1)
         root.addLayout(top_row)
 
-        self.status_label = QLabel("状态：空闲")
-        self.eta_label = QLabel("预计剩余时间：--")
+        self.status_label = QLabel('状态：空闲')
+        self.eta_label = QLabel('预计剩余时间：--')
         root.addWidget(self.status_label)
         root.addWidget(self.eta_label)
 
@@ -361,7 +401,7 @@ class ExportQueueDialog(QDialog):
         root.addWidget(self.progress_bar)
 
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["数据库", "状态", "进度"])
+        self.table.setHorizontalHeaderLabels(['数据库', '状态', '进度'])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -371,24 +411,58 @@ class ExportQueueDialog(QDialog):
         root.addWidget(self.table, 1)
 
         btn_row = QHBoxLayout()
-        self.btn_close = QPushButton("关闭")
+        self.btn_pause = QPushButton('暂停')
+        self.btn_cancel = QPushButton('取消导出')
+        self.btn_close = QPushButton('关闭')
+        self.btn_pause.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
         btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_pause)
+        btn_row.addWidget(self.btn_cancel)
         btn_row.addWidget(self.btn_close)
         root.addLayout(btn_row)
 
         self.btn_close.clicked.connect(self.hide)
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_cancel.clicked.connect(self._cancel_export)
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._update_eta)
 
-    def enqueue_exports(self, tasks, zip_path=""):
+    def _toggle_pause(self):
+        if not self._worker or not self._worker.isRunning():
+            return
+        paused = self.btn_pause.text() == '暂停'
+        try:
+            self._worker.set_paused(paused)
+        except Exception:
+            pass
+        if paused:
+            self.btn_pause.setText('继续')
+            self.status_label.setText('状态：已暂停')
+        else:
+            self.btn_pause.setText('暂停')
+            self.status_label.setText('状态：导出中')
+
+    def _cancel_export(self):
+        if not self._worker or not self._worker.isRunning():
+            return
+        try:
+            self._worker.cancel()
+        except Exception:
+            pass
+        self.status_label.setText('状态：已取消')
+        self.btn_cancel.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+
+    def enqueue_exports(self, tasks, zip_path=''):
         if self._worker and self._worker.isRunning():
-            QMessageBox.information(self, "提示", "正在导出，请等待完成。")
+            QMessageBox.information(self, '提示', '正在导出，请等待完成。')
             return False
         if not tasks:
             return False
-        self._zip_path = zip_path or ""
+        self._zip_path = zip_path or ''
         self._tasks = tasks
         self._build_table()
         self.start_export()
@@ -398,19 +472,34 @@ class ExportQueueDialog(QDialog):
         self._task_info = {}
         self.table.setRowCount(len(self._tasks))
         for row, task in enumerate(self._tasks):
-            db_path = task.get("db_path") or ""
+            db_path = task.get('db_path') or ''
             name = os.path.basename(db_path)
             self.table.setItem(row, 0, QTableWidgetItem(name))
-            self.table.setItem(row, 1, QTableWidgetItem("等待"))
-            self.table.setItem(row, 2, QTableWidgetItem("0%"))
-            self._task_info[db_path] = {"row": row, "done": 0, "total": 0, "status": "等待"}
+            self.table.setItem(row, 1, QTableWidgetItem('等待'))
+            self.table.setItem(row, 2, QTableWidgetItem('0%'))
+            self._task_info[db_path] = {'row': row, 'done': 0, 'total': 0, 'status': '等待'}
+
+    def show_completed_task(self, name: str):
+        self._tasks = [{'db_path': name, 'out_path': ''}]
+        self._task_info = {name: {'row': 0, 'done': 1, 'total': 1, 'status': '完成'}}
+        self.table.setRowCount(1)
+        self.table.setItem(0, 0, QTableWidgetItem(os.path.basename(name)))
+        self.table.setItem(0, 1, QTableWidgetItem('完成'))
+        self.table.setItem(0, 2, QTableWidgetItem('100%'))
+        self.progress_bar.setValue(100)
+        self.status_label.setText('状态：已完成')
+        self.eta_label.setText('预计剩余时间：00:00')
+        self.thread_spin.setEnabled(True)
 
     def start_export(self):
+        self.btn_pause.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
+        self.btn_pause.setText('暂停')
         if not self._tasks:
             return
         self.progress_bar.setValue(0)
-        self.status_label.setText("状态：导出中")
-        self.eta_label.setText("预计剩余时间：计算中")
+        self.status_label.setText('状态：导出中')
+        self.eta_label.setText('预计剩余时间：计算中')
         self._start_ts = time.time()
         self.thread_spin.setEnabled(False)
 
@@ -426,45 +515,48 @@ class ExportQueueDialog(QDialog):
         info = self._task_info.get(db_path)
         if not info:
             return
-        info["done"] = max(0, int(done))
+        info['done'] = max(0, int(done))
         if total is not None and int(total) > 0:
-            info["total"] = int(total)
+            info['total'] = int(total)
         self._update_row_progress(db_path)
 
     def _on_task_status(self, db_path, status):
         info = self._task_info.get(db_path)
         if not info:
             return
-        info["status"] = status
-        row = info["row"]
+        info['status'] = status
+        row = info['row']
         item = self.table.item(row, 1)
         if item:
             item.setText(status)
 
     def _on_phase(self, phase):
-        self.status_label.setText(f"状态：{phase}")
+        self.status_label.setText(f'状态：{phase}')
 
     def _on_finished(self, ok_paths, failed_paths, zip_path):
         self._timer.stop()
         self.thread_spin.setEnabled(True)
         self.progress_bar.setValue(100)
+        self.btn_cancel.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText('暂停')
         if failed_paths:
-            self.status_label.setText("状态：已完成（部分失败）")
+            self.status_label.setText('状态：已完成（部分失败）')
         else:
-            self.status_label.setText("状态：已完成")
+            self.status_label.setText('状态：已完成')
 
     def _update_row_progress(self, db_path):
         info = self._task_info.get(db_path)
         if not info:
             return
-        row = info["row"]
-        done = info.get("done", 0)
-        total = info.get("total", 0)
+        row = info['row']
+        done = info.get('done', 0)
+        total = info.get('total', 0)
         if total > 0:
             pct = min(100.0, 100.0 * float(done) / float(total))
-            text = f"{pct:.1f}% ({done}/{total})"
+            text = f'{pct:.1f}% ({done}/{total})'
         else:
-            text = f"{done}"
+            text = f'{done}'
         item = self.table.item(row, 2)
         if item:
             item.setText(text)
@@ -474,23 +566,23 @@ class ExportQueueDialog(QDialog):
             total = 0
             done = 0
             for info in self._task_info.values():
-                if info.get("total", 0) > 0:
-                    total += info.get("total", 0)
-                    done += min(info.get("done", 0), info.get("total", 0))
+                if info.get('total', 0) > 0:
+                    total += info.get('total', 0)
+                    done += min(info.get('done', 0), info.get('total', 0))
             if total <= 0:
-                self.eta_label.setText("预计剩余时间：计算中")
+                self.eta_label.setText('预计剩余时间：计算中')
                 return
             if self._start_ts is None:
                 return
             elapsed = max(0.001, time.time() - float(self._start_ts))
             rate = float(done) / elapsed if done > 0 else 0.0
             if rate <= 0:
-                self.eta_label.setText("预计剩余时间：计算中")
+                self.eta_label.setText('预计剩余时间：计算中')
                 return
             remain = max(0.0, float(total - done) / rate)
             mm = int(remain // 60)
             ss = int(remain % 60)
-            self.eta_label.setText(f"预计剩余时间：{mm:02d}:{ss:02d}")
+            self.eta_label.setText(f'预计剩余时间：{mm:02d}:{ss:02d}')
             pct = min(100.0, 100.0 * float(done) / float(total))
             self.progress_bar.setValue(int(pct))
         except Exception:
@@ -4586,14 +4678,29 @@ class MainWindow(QMainWindow):
 
         try:
             if use_db:
-                self._export_xlsx_from_db(db_path, path)
+                dlg = self._get_export_queue_dialog()
+                dlg.show()
+                try:
+                    dlg.raise_()
+                    dlg.activateWindow()
+                except Exception:
+                    pass
+                tasks = [{"db_path": db_path, "out_path": path}]
+                dlg.enqueue_exports(tasks)
             else:
                 self._export_xlsx_from_ring(path, xs, ys_map, xs_wall, qf_vals=qf_vals)
+                dlg = self._get_export_queue_dialog()
+                dlg.show()
+                try:
+                    dlg.raise_()
+                    dlg.activateWindow()
+                except Exception:
+                    pass
+                dlg.show_completed_task(path)
             self.set_status(f"已保存：{path}")
         except Exception as e:
-            QMessageBox.critical(self, "\u4fdd\u5b58\u5931\u8d25", f"\u4fdd\u5b58 xlsx \u5931\u8d25\uff1a\\n{e}")
+            QMessageBox.critical(self, "保存失败", f"保存 xlsx 失败：\n{e}")
 
-    @staticmethod
     def _safe_sheet_name(name: str) -> str:
         bad = ['\\', '/', '*', '[', ']', ':', '?']
         s = "".join("_" if ch in bad else ch for ch in name).strip() or "Sheet"
