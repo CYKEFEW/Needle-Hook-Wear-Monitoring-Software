@@ -448,7 +448,7 @@ class ExportQueueDialog(QDialog):
         if total_bytes <= 0:
             return 2.0
         size_mb = float(total_bytes) / (1024.0 * 1024.0)
-        seconds = size_mb * 0.4
+        seconds = size_mb * 0.4 * 5.0
         if seconds < 1.0:
             seconds = 1.0
         if seconds > 60.0:
@@ -653,6 +653,9 @@ class ExportQueueDialog(QDialog):
                 if not info.get("finish_mode"):
                     info["finish_mode"] = True
                     info["finish_start_ts"] = time.time()
+            status_item = self.table.item(info["row"], 1)
+            if status_item:
+                status_item.setText("收尾中")
         self.status_label.setText(f"状态：{phase}")
 
     def _on_finished(self, ok_paths, failed_paths, zip_path):
@@ -732,8 +735,18 @@ class ExportQueueDialog(QDialog):
                 self.eta_label.setText("预计剩余时间：计算中")
                 return
             remain = max(0.0, float(total - done) / rate)
+            finish_remain = 0.0
+            now_ts = time.time()
+            for info in self._task_info.values():
+                if info.get("finish_mode") and info.get("finish_start_ts") is not None:
+                    fin_total = max(0.1, float(info.get("finish_seconds", 1.0)))
+                    fin_elapsed = max(0.0, now_ts - float(info.get("finish_start_ts")))
+                    finish_remain += max(0.0, fin_total - fin_elapsed)
             mm = int(remain // 60)
             ss = int(remain % 60)
+            total_remain = remain + finish_remain
+            mm = int(total_remain // 60)
+            ss = int(total_remain % 60)
             self.eta_label.setText(f"预计剩余时间：{mm:02d}:{ss:02d}")
 
             if self.progress_bar.maximum() <= 0:
