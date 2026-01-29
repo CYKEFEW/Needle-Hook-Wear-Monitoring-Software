@@ -634,6 +634,7 @@ class ExportQueueDialog(QDialog):
             bar = self._progress_bars.get(db_path)
             if bar:
                 bar.setValue(100)
+        self._update_overall_status()
 
     def _on_task_error(self, db_path, msg):
         if msg:
@@ -656,7 +657,7 @@ class ExportQueueDialog(QDialog):
             status_item = self.table.item(info["row"], 1)
             if status_item:
                 status_item.setText("收尾中")
-        self.status_label.setText(f"状态：{phase}")
+        self._update_overall_status()
 
     def _on_finished(self, ok_paths, failed_paths, zip_path):
         self._timer.stop()
@@ -673,6 +674,7 @@ class ExportQueueDialog(QDialog):
             self.status_label.setText("状态：已完成（部分失败）")
         else:
             self.status_label.setText("状态：已完成")
+        self._update_overall_status(force=True)
 
     def _update_row_progress(self, db_path):
         info = self._task_info.get(db_path)
@@ -768,8 +770,28 @@ class ExportQueueDialog(QDialog):
                         bar.setValue(int(max(0, min(99, pct_hidden))))
             avg_pct = total_pct / max(1, len(self._task_info))
             self.progress_bar.setValue(int(min(99, max(0, avg_pct))))
+            self._update_overall_status()
         except Exception:
             pass
+
+    def _update_overall_status(self, force: bool = False):
+        if not self._task_info:
+            if force:
+                self.status_label.setText("状态：空闲")
+            return
+        statuses = [info.get("status", "") for info in self._task_info.values()]
+        if any(s == "导出中" for s in statuses):
+            self.status_label.setText("状态：导出中")
+            return
+        if any(s == "收尾中" for s in statuses) or any(info.get("finish_mode") for info in self._task_info.values()):
+            self.status_label.setText("状态：收尾中")
+            return
+        if all(s == "完成" for s in statuses):
+            self.status_label.setText("状态：完成")
+            return
+        if any(s == "失败" for s in statuses):
+            self.status_label.setText("状态：失败")
+            return
 
 class MainWindow(QMainWindow):
 
