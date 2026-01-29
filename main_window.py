@@ -246,6 +246,7 @@ class ExportQueueWorker(QThread):
     progress = Signal(str, int, int)
     status = Signal(str, str)
     phase = Signal(str, str)
+    error = Signal(str, str)
     finished = Signal(list, list, str)
 
     def __init__(self, tasks, export_func, max_workers=8, zip_path=""):
@@ -320,7 +321,11 @@ class ExportQueueWorker(QThread):
                     return False, (db_path, "")
                 self.status.emit(db_path, "完成")
                 return True, (db_path, out_path)
-            except Exception:
+            except Exception as e:
+                try:
+                    self.error.emit(db_path, str(e))
+                except Exception:
+                    pass
                 self.status.emit(db_path, "失败")
                 return False, (db_path, "")
 
@@ -572,6 +577,7 @@ class ExportQueueDialog(QDialog):
         self._worker.progress.connect(self._on_task_progress)
         self._worker.status.connect(self._on_task_status)
         self._worker.phase.connect(self._on_phase)
+        self._worker.error.connect(self._on_task_error)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
         self._timer.start()
@@ -628,6 +634,11 @@ class ExportQueueDialog(QDialog):
             bar = self._progress_bars.get(db_path)
             if bar:
                 bar.setValue(100)
+
+    def _on_task_error(self, db_path, msg):
+        if msg:
+            self.status_label.setText(f"状态：失败 - {msg}")
+            QMessageBox.warning(self, "导出失败", f"数据库：{os.path.basename(db_path)}\n错误：{msg}")
 
     def _on_phase(self, db_path, phase):
         if db_path == "__zip__":
@@ -4935,6 +4946,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存 xlsx 失败：\n{e}")
 
+    @staticmethod
     def _safe_sheet_name(name: str) -> str:
         bad = ['\\', '/', '*', '[', ']', ':', '?']
         s = "".join("_" if ch in bad else ch for ch in name).strip() or "Sheet"
