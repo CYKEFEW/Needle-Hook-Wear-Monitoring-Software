@@ -5058,5 +5058,3 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-
-
