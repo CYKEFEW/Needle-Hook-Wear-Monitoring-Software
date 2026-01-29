@@ -245,7 +245,7 @@ class HistoryDbDialog(QDialog):
 class ExportQueueWorker(QThread):
     progress = Signal(str, int, int)
     status = Signal(str, str)
-    phase = Signal(str)
+    phase = Signal(str, str)
     finished = Signal(list, list, str)
 
     def __init__(self, tasks, export_func, max_workers=8, zip_path=""):
@@ -280,13 +280,13 @@ class ExportQueueWorker(QThread):
         def _wait_if_paused():
             while self._pause_event.is_set():
                 if self._cancel_event.is_set():
-                    raise RuntimeError('cancelled')
+                    raise RuntimeError("cancelled")
                 time.sleep(0.1)
 
         def progress_cb(ctx, done, total):
             _wait_if_paused()
             if self._cancel_event.is_set():
-                raise RuntimeError('cancelled')
+                raise RuntimeError("cancelled")
             try:
                 total_i = int(total) if total is not None else -1
             except Exception:
@@ -299,34 +299,40 @@ class ExportQueueWorker(QThread):
 
         def run_one(task):
             if self._cancel_event.is_set():
-                return False, (task.get('db_path') or '', '')
-            db_path = task.get('db_path') or ''
-            out_path = task.get('out_path') or ''
+                return False, (task.get("db_path") or "", "")
+            db_path = task.get("db_path") or ""
+            out_path = task.get("out_path") or ""
             if not db_path:
-                return False, ('', '')
-            self.status.emit(db_path, '导出中')
+                return False, ("", "")
+            self.status.emit(db_path, "导出中")
             try:
                 _wait_if_paused()
                 if self._cancel_event.is_set():
-                    return False, (db_path, '')
-                self._export_func(db_path, out_path, progress_cb=progress_cb, progress_ctx=db_path, phase_cb=self.phase.emit)
+                    return False, (db_path, "")
+                self._export_func(
+                    db_path,
+                    out_path,
+                    progress_cb=progress_cb,
+                    progress_ctx=db_path,
+                    phase_cb=lambda p: self.phase.emit(db_path, str(p)),
+                )
                 if self._cancel_event.is_set():
-                    return False, (db_path, '')
-                self.status.emit(db_path, '完成')
+                    return False, (db_path, "")
+                self.status.emit(db_path, "完成")
                 return True, (db_path, out_path)
             except Exception:
-                self.status.emit(db_path, '失败')
-                return False, (db_path, '')
+                self.status.emit(db_path, "失败")
+                return False, (db_path, "")
 
         tmp_ctx = None
         if zip_path:
             tmp_ctx = tempfile.TemporaryDirectory()
             for task in self._tasks:
-                if task.get('out_path'):
+                if task.get("out_path"):
                     continue
-                db_path = task.get('db_path') or ''
+                db_path = task.get("db_path") or ""
                 base = os.path.splitext(os.path.basename(db_path))[0]
-                task['out_path'] = os.path.join(tmp_ctx.name, base + '.xlsx')
+                task["out_path"] = os.path.join(tmp_ctx.name, base + ".xlsx")
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as ex:
@@ -345,17 +351,17 @@ class ExportQueueWorker(QThread):
                         failed.append(payload[0])
 
             if zip_path and exported and (not self._cancel_event.is_set()):
-                self.phase.emit('打包中')
+                self.phase.emit("__zip__", "打包中")
                 try:
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                         for db_path, out_path in exported:
                             if not out_path:
                                 continue
                             arc_name = os.path.basename(out_path)
                             zf.write(out_path, arcname=arc_name)
-                    self.phase.emit('打包完成')
+                    self.phase.emit("__zip__", "打包完成")
                 except Exception:
-                    self.phase.emit('打包失败')
+                    self.phase.emit("__zip__", "打包失败")
         finally:
             try:
                 if tmp_ctx is not None:
@@ -375,6 +381,8 @@ class ExportQueueDialog(QDialog):
         self._worker = None
         self._zip_path = ""
         self._start_ts = None
+        self._size_map = {}
+        self._progress_bars = {}
 
         self.setWindowTitle("导出队列")
         self.resize(720, 480)
@@ -400,11 +408,12 @@ class ExportQueueDialog(QDialog):
         self.progress_bar.setValue(0)
         root.addWidget(self.progress_bar)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["数据库", "状态", "进度"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["数据库", "状态", "进度条", "进度"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -430,6 +439,17 @@ class ExportQueueDialog(QDialog):
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._update_eta)
 
+    def _estimate_finish_seconds(self, total_bytes: int) -> float:
+        if total_bytes <= 0:
+            return 2.0
+        size_mb = float(total_bytes) / (1024.0 * 1024.0)
+        seconds = size_mb * 0.4
+        if seconds < 1.0:
+            seconds = 1.0
+        if seconds > 60.0:
+            seconds = 60.0
+        return seconds
+
     def _toggle_pause(self):
         if not self._worker or not self._worker.isRunning():
             return
@@ -448,16 +468,11 @@ class ExportQueueDialog(QDialog):
     def _cancel_export(self):
         if not self._worker or not self._worker.isRunning():
             return
-        try:
-            self._worker.cancel()
-        except Exception:
-            pass
-        try:
-            self._timer.stop()
-        except Exception:
-            pass
+        self.force_stop_exports()
         self._tasks = []
         self._task_info = {}
+        self._size_map = {}
+        self._progress_bars = {}
         self.table.setRowCount(0)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -476,6 +491,15 @@ class ExportQueueDialog(QDialog):
             return False
         self._zip_path = zip_path or ""
         self._tasks = tasks
+        self._size_map = {}
+        self._progress_bars = {}
+        for task in tasks:
+            db_path = task.get("db_path") or ""
+            try:
+                if db_path and os.path.isfile(db_path):
+                    self._size_map[db_path] = os.path.getsize(db_path)
+            except Exception:
+                self._size_map[db_path] = 0
         self._build_table()
         self.start_export()
         return True
@@ -488,8 +512,25 @@ class ExportQueueDialog(QDialog):
             name = os.path.basename(db_path)
             self.table.setItem(row, 0, QTableWidgetItem(name))
             self.table.setItem(row, 1, QTableWidgetItem("等待"))
-            self.table.setItem(row, 2, QTableWidgetItem("0%"))
-            self._task_info[db_path] = {"row": row, "done": 0, "total": 0, "status": "等待"}
+            self.table.setItem(row, 3, QTableWidgetItem("0%"))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat("%p%")
+            bar.setTextVisible(True)
+            self.table.setCellWidget(row, 2, bar)
+            self._progress_bars[db_path] = bar
+            size_b = self._size_map.get(db_path, 0)
+            self._task_info[db_path] = {
+                "row": row,
+                "done": 0,
+                "total": 0,
+                "status": "等待",
+                "pending_finish": False,
+                "finish_mode": False,
+                "finish_start_ts": None,
+                "finish_seconds": self._estimate_finish_seconds(size_b),
+            }
 
     def show_completed_task(self, name: str):
         self._tasks = [{"db_path": name, "out_path": ""}]
@@ -497,7 +538,13 @@ class ExportQueueDialog(QDialog):
         self.table.setRowCount(1)
         self.table.setItem(0, 0, QTableWidgetItem(os.path.basename(name)))
         self.table.setItem(0, 1, QTableWidgetItem("完成"))
-        self.table.setItem(0, 2, QTableWidgetItem("100%"))
+        self.table.setItem(0, 3, QTableWidgetItem("100%"))
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(100)
+        bar.setFormat("%p%")
+        bar.setTextVisible(True)
+        self.table.setCellWidget(0, 2, bar)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.status_label.setText("状态：已完成")
@@ -515,6 +562,10 @@ class ExportQueueDialog(QDialog):
         self.status_label.setText("状态：导出中")
         self.eta_label.setText("预计剩余时间：计算中")
         self._start_ts = time.time()
+        for info in self._task_info.values():
+            info["pending_finish"] = False
+            info["finish_mode"] = False
+            info["finish_start_ts"] = None
         self.thread_spin.setEnabled(False)
 
         self._worker = ExportQueueWorker(self._tasks, self._export_func, self.thread_spin.value(), self._zip_path)
@@ -525,6 +576,32 @@ class ExportQueueDialog(QDialog):
         self._worker.start()
         self._timer.start()
 
+    def is_exporting(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
+    def force_stop_exports(self, wait_ms: int = 3000):
+        if not self._worker:
+            return
+        try:
+            self._worker.cancel()
+        except Exception:
+            pass
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._worker.isRunning():
+                self._worker.wait(wait_ms)
+        except Exception:
+            pass
+        try:
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(1000)
+        except Exception:
+            pass
+
     def _on_task_progress(self, db_path, done, total):
         info = self._task_info.get(db_path)
         if not info:
@@ -532,6 +609,10 @@ class ExportQueueDialog(QDialog):
         info["done"] = max(0, int(done))
         if total is not None and int(total) > 0:
             info["total"] = int(total)
+        if info.get("pending_finish") and (not info.get("finish_mode")):
+            if info.get("total", 0) > 0 and info.get("done", 0) >= info.get("total", 0):
+                info["finish_mode"] = True
+                info["finish_start_ts"] = time.time()
         self._update_row_progress(db_path)
 
     def _on_task_status(self, db_path, status):
@@ -543,15 +624,24 @@ class ExportQueueDialog(QDialog):
         item = self.table.item(row, 1)
         if item:
             item.setText(status)
+        if status == "完成":
+            bar = self._progress_bars.get(db_path)
+            if bar:
+                bar.setValue(100)
 
-    def _on_phase(self, phase):
-        try:
-            if phase == "收尾中":
-                self.progress_bar.setRange(0, 0)
-            else:
-                self.progress_bar.setRange(0, 100)
-        except Exception:
-            pass
+    def _on_phase(self, db_path, phase):
+        if db_path == "__zip__":
+            self.status_label.setText(f"状态：{phase}")
+            return
+        info = self._task_info.get(db_path)
+        if not info:
+            return
+        if phase == "收尾中":
+            info["pending_finish"] = True
+            if info.get("total", 0) > 0 and info.get("done", 0) >= info.get("total", 0):
+                if not info.get("finish_mode"):
+                    info["finish_mode"] = True
+                    info["finish_start_ts"] = time.time()
         self.status_label.setText(f"状态：{phase}")
 
     def _on_finished(self, ok_paths, failed_paths, zip_path):
@@ -562,6 +652,9 @@ class ExportQueueDialog(QDialog):
         self.btn_cancel.setEnabled(False)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
+        for db_path, bar in self._progress_bars.items():
+            if bar:
+                bar.setValue(100)
         if failed_paths:
             self.status_label.setText("状态：已完成（部分失败）")
         else:
@@ -579,9 +672,35 @@ class ExportQueueDialog(QDialog):
             text = f"{pct:.1f}% ({done}/{total})"
         else:
             text = f"{done}"
-        item = self.table.item(row, 2)
+        item = self.table.item(row, 3)
         if item:
             item.setText(text)
+        bar = self._progress_bars.get(db_path)
+        if bar:
+            now_ts = time.time()
+            pct_hidden = self._calc_task_progress(info, now_ts)
+            if info.get("status") == "完成":
+                bar.setValue(100)
+            else:
+                bar.setValue(int(max(0, min(99, pct_hidden))))
+
+    def _calc_task_progress(self, info, now_ts: float) -> float:
+        if info.get("status") == "完成":
+            return 100.0
+        total = info.get("total", 0)
+        done = info.get("done", 0)
+        if total > 0:
+            pct_export = 90.0 * float(done) / float(total)
+        else:
+            pct_export = 0.0
+        pct_export = max(0.0, min(90.0, pct_export))
+        if info.get("finish_mode") and info.get("finish_start_ts") is not None:
+            fin_elapsed = max(0.0, now_ts - float(info.get("finish_start_ts")))
+            fin_total = max(0.1, float(info.get("finish_seconds", 1.0)))
+            fin_ratio = max(0.0, min(1.0, fin_elapsed / fin_total))
+            fin_pct = 90.0 + 9.0 * fin_ratio
+            return max(pct_export, min(99.0, fin_pct))
+        return pct_export
 
     def _update_eta(self):
         try:
@@ -605,9 +724,26 @@ class ExportQueueDialog(QDialog):
             mm = int(remain // 60)
             ss = int(remain % 60)
             self.eta_label.setText(f"预计剩余时间：{mm:02d}:{ss:02d}")
-            pct = min(100.0, 100.0 * float(done) / float(total))
-            if self.progress_bar.maximum() > 0:
-                self.progress_bar.setValue(int(pct))
+
+            if self.progress_bar.maximum() <= 0:
+                return
+            if not self._task_info:
+                self.progress_bar.setValue(0)
+                return
+            now_ts = time.time()
+            total_pct = 0.0
+            for info in self._task_info.values():
+                total_pct += self._calc_task_progress(info, now_ts)
+            for db_path, info in self._task_info.items():
+                bar = self._progress_bars.get(db_path)
+                if bar:
+                    pct_hidden = self._calc_task_progress(info, now_ts)
+                    if info.get("status") == "完成":
+                        bar.setValue(100)
+                    else:
+                        bar.setValue(int(max(0, min(99, pct_hidden))))
+            avg_pct = total_pct / max(1, len(self._task_info))
+            self.progress_bar.setValue(int(min(99, max(0, avg_pct))))
         except Exception:
             pass
 
@@ -4299,10 +4435,27 @@ class MainWindow(QMainWindow):
             return "无量纲"
         return f"{u}【单位】"
 
+    def _split_sheet_name(self, base_title: str, idx: int) -> str:
+        base = self._safe_sheet_name(base_title)
+        name = f"{base}_{idx}" if idx > 1 else base
+        if len(name) > 31:
+            name = name[:31]
+        return name
+
+    def _create_sheet_with_header_cells(self, wb, base_title: str, idx: int, headers):
+        ws = wb.create_sheet(title=self._split_sheet_name(base_title, idx))
+        for col, h in enumerate(headers, start=1):
+            ws.cell(row=1, column=col, value=h)
+        return ws
+
+    def _create_sheet_with_header_append(self, wb, base_title: str, idx: int, headers):
+        ws = wb.create_sheet(self._split_sheet_name(base_title, idx))
+        ws.append(headers)
+        return ws
+
     def _export_xlsx_from_ring(self, path: str, xs, ys_map, xs_wall, qf_vals=None):
         wb = Workbook()
-        ws_all = wb.active
-        ws_all.title = "All"
+        max_rows = 1048576
 
         headers = ["Time"]
         units = list(getattr(self, "_log_units", []))
@@ -4311,25 +4464,34 @@ class MainWindow(QMainWindow):
             unit_label = self._unit_label(unit)
             headers.append(f"{name}({unit_label})" if unit_label else name)
         headers += ["摩擦力(N【牛】)", "摩擦系数", self._quality_flag_label]
+
+        ws_all_idx = 1
+        ws_all = wb.active
+        ws_all.title = self._split_sheet_name("All", ws_all_idx)
         for i, h in enumerate(headers, start=1):
             ws_all.cell(row=1, column=i, value=h)
+        ws_all_row = 2
 
         nrows = len(xs)
         hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
         lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
 
-        for r, rel_ts in enumerate(xs, start=2):
-            wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
+        for i, rel_ts in enumerate(xs):
+            if ws_all_row > max_rows:
+                ws_all_idx += 1
+                ws_all = self._create_sheet_with_header_cells(wb, "All", ws_all_idx, headers)
+                ws_all_row = 2
+            wall_ts = xs_wall[i] if xs_wall and i < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
-            ws_all.cell(row=r, column=1, value=t_str)
+            ws_all.cell(row=ws_all_row, column=1, value=t_str)
 
             row_vals = []
             col_idx = 2
             for c, name in enumerate(self.channel_names, start=2):
                 col = ys_map.get(name, [])
-                v = col[r - 2] if (r - 2) < len(col) else None
+                v = col[i] if i < len(col) else None
                 row_vals.append(v)
-                ws_all.cell(row=r, column=col_idx, value=v)
+                ws_all.cell(row=ws_all_row, column=col_idx, value=v)
                 col_idx += 1
 
             high_v = None
@@ -4345,66 +4507,90 @@ class MainWindow(QMainWindow):
                 except Exception:
                     low_v = None
             fric_n, mu = self._calc_fric_mu(high_v, low_v)
-            ws_all.cell(row=r, column=col_idx, value=fric_n)
-            ws_all.cell(row=r, column=col_idx + 1, value=mu)
+            ws_all.cell(row=ws_all_row, column=col_idx, value=fric_n)
+            ws_all.cell(row=ws_all_row, column=col_idx + 1, value=mu)
             col_idx += 2
 
-            qf_v = qf_vals[r - 2] if (qf_vals is not None and (r - 2) < len(qf_vals)) else None
-            ws_all.cell(row=r, column=col_idx, value=qf_v)
+            qf_v = qf_vals[i] if (qf_vals is not None and i < len(qf_vals)) else None
+            ws_all.cell(row=ws_all_row, column=col_idx, value=qf_v)
+
+            ws_all_row += 1
 
         for i, name in enumerate(self.channel_names):
-            ws = wb.create_sheet(title=self._safe_sheet_name(name))
-            ws.cell(row=1, column=1, value="Time")
             unit = units[i] if i < len(units) else ""
             unit_label = self._unit_label(unit)
-            ws.cell(row=1, column=2, value=f"{name}({unit_label})" if unit_label else name)
+            header = ["Time", f"{name}({unit_label})" if unit_label else name]
+            ws_idx = 1
+            ws = self._create_sheet_with_header_cells(wb, name, ws_idx, header)
+            row_idx = 2
             vals = ys_map.get(name, [])
             for r in range(nrows):
+                if row_idx > max_rows:
+                    ws_idx += 1
+                    ws = self._create_sheet_with_header_cells(wb, name, ws_idx, header)
+                    row_idx = 2
                 wall_ts = xs_wall[r] if xs_wall and r < len(xs_wall) else None
                 t_str = self._format_export_time(wall_ts, xs[r])
-                ws.cell(row=r + 2, column=1, value=t_str)
+                ws.cell(row=row_idx, column=1, value=t_str)
                 v = vals[r] if r < len(vals) else None
-                ws.cell(row=r + 2, column=2, value=v)
+                ws.cell(row=row_idx, column=2, value=v)
+                row_idx += 1
 
         if qf_vals is not None:
-            ws_q = wb.create_sheet(title=self._safe_sheet_name(self._quality_flag_name))
-            ws_q.cell(row=1, column=1, value="Time")
-            ws_q.cell(row=1, column=2, value=self._quality_flag_label)
+            q_header = ["Time", self._quality_flag_label]
+            ws_q_idx = 1
+            ws_q = self._create_sheet_with_header_cells(wb, self._quality_flag_name, ws_q_idx, q_header)
+            row_idx = 2
             for r in range(nrows):
+                if row_idx > max_rows:
+                    ws_q_idx += 1
+                    ws_q = self._create_sheet_with_header_cells(wb, self._quality_flag_name, ws_q_idx, q_header)
+                    row_idx = 2
                 wall_ts = xs_wall[r] if xs_wall and r < len(xs_wall) else None
                 t_str = self._format_export_time(wall_ts, xs[r])
-                ws_q.cell(row=r + 2, column=1, value=t_str)
+                ws_q.cell(row=row_idx, column=1, value=t_str)
                 qv = qf_vals[r] if r < len(qf_vals) else None
-                ws_q.cell(row=r + 2, column=2, value=qv)
+                ws_q.cell(row=row_idx, column=2, value=qv)
+                row_idx += 1
 
-        ws_f = wb.create_sheet(title="摩擦力")
-        ws_f.cell(row=1, column=1, value="Time")
-        ws_f.cell(row=1, column=2, value="摩擦力(N【牛】)")
-        ws_f.cell(row=1, column=3, value=self._quality_flag_label)
-        ws_mu = wb.create_sheet(title="摩擦系数")
-        ws_mu.cell(row=1, column=1, value="Time")
-        ws_mu.cell(row=1, column=2, value="摩擦系数")
-        ws_mu.cell(row=1, column=3, value=self._quality_flag_label)
-        for r, rel_ts in enumerate(xs, start=2):
-            wall_ts = xs_wall[r - 2] if xs_wall and (r - 2) < len(xs_wall) else None
+        f_header = ["Time", "摩擦力(N【牛】)", self._quality_flag_label]
+        mu_header = ["Time", "摩擦系数", self._quality_flag_label]
+        ws_f_idx = 1
+        ws_mu_idx = 1
+        ws_f = self._create_sheet_with_header_cells(wb, "摩擦力", ws_f_idx, f_header)
+        ws_mu = self._create_sheet_with_header_cells(wb, "摩擦系数", ws_mu_idx, mu_header)
+        ws_f_row = 2
+        ws_mu_row = 2
+        for i, rel_ts in enumerate(xs):
+            if ws_f_row > max_rows:
+                ws_f_idx += 1
+                ws_f = self._create_sheet_with_header_cells(wb, "摩擦力", ws_f_idx, f_header)
+                ws_f_row = 2
+            if ws_mu_row > max_rows:
+                ws_mu_idx += 1
+                ws_mu = self._create_sheet_with_header_cells(wb, "摩擦系数", ws_mu_idx, mu_header)
+                ws_mu_row = 2
+            wall_ts = xs_wall[i] if xs_wall and i < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
             fric_n = None
             mu = None
             if hi_name and lo_name and hi_name in ys_map and lo_name in ys_map:
                 try:
-                    hv = ys_map.get(hi_name, [])[r - 2]
-                    lv = ys_map.get(lo_name, [])[r - 2]
+                    hv = ys_map.get(hi_name, [])[i]
+                    lv = ys_map.get(lo_name, [])[i]
                 except Exception:
                     hv = None
                     lv = None
                 fric_n, mu = self._calc_fric_mu(hv, lv)
-            ws_f.cell(row=r, column=1, value=t_str)
-            ws_f.cell(row=r, column=2, value=fric_n)
-            qf_v = qf_vals[r - 2] if (qf_vals is not None and (r - 2) < len(qf_vals)) else None
-            ws_f.cell(row=r, column=3, value=qf_v)
-            ws_mu.cell(row=r, column=1, value=t_str)
-            ws_mu.cell(row=r, column=2, value=mu)
-            ws_mu.cell(row=r, column=3, value=qf_v)
+            ws_f.cell(row=ws_f_row, column=1, value=t_str)
+            ws_f.cell(row=ws_f_row, column=2, value=fric_n)
+            qf_v = qf_vals[i] if (qf_vals is not None and i < len(qf_vals)) else None
+            ws_f.cell(row=ws_f_row, column=3, value=qf_v)
+            ws_mu.cell(row=ws_mu_row, column=1, value=t_str)
+            ws_mu.cell(row=ws_mu_row, column=2, value=mu)
+            ws_mu.cell(row=ws_mu_row, column=3, value=qf_v)
+            ws_f_row += 1
+            ws_mu_row += 1
 
         for ws in wb.worksheets:
             self._autosize_sheet(ws)
@@ -4449,8 +4635,9 @@ class MainWindow(QMainWindow):
             cols_sql = ", ".join(["ts"] + col_names) if col_names else "ts"
             query = f"SELECT {cols_sql} FROM data ORDER BY id"
 
+            max_rows = 1048576
             wb = Workbook(write_only=True)
-            ws_all = wb.create_sheet("All")
+
             headers = ["Time"]
             for idx, name in enumerate(channel_names):
                 if name == self._quality_flag_name:
@@ -4459,11 +4646,18 @@ class MainWindow(QMainWindow):
                 unit_label = self._unit_label(unit)
                 headers.append(f"{name}({unit_label})" if unit_label else name)
             headers += ["摩擦力(N【牛】)", "摩擦系数", self._quality_flag_label]
-            ws_all.append(headers)
-            ws_f = wb.create_sheet("摩擦力")
-            ws_f.append(["Time", "摩擦力(N【牛】)", self._quality_flag_label])
-            ws_mu = wb.create_sheet("摩擦系数")
-            ws_mu.append(["Time", "摩擦系数", self._quality_flag_label])
+
+            ws_all_idx = 1
+            ws_all = self._create_sheet_with_header_append(wb, "All", ws_all_idx, headers)
+            ws_all_rows = 1
+            f_header = ["Time", "摩擦力(N【牛】)", self._quality_flag_label]
+            mu_header = ["Time", "摩擦系数", self._quality_flag_label]
+            ws_f_idx = 1
+            ws_mu_idx = 1
+            ws_f = self._create_sheet_with_header_append(wb, "摩擦力", ws_f_idx, f_header)
+            ws_mu = self._create_sheet_with_header_append(wb, "摩擦系数", ws_mu_idx, mu_header)
+            ws_f_rows = 1
+            ws_mu_rows = 1
 
             hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
             lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
@@ -4494,9 +4688,27 @@ class MainWindow(QMainWindow):
 
                     fric_n, mu = self._calc_fric_mu(high_v, low_v)
                     row_out += [fric_n, mu, qf_val]
+
+                    if ws_all_rows >= max_rows:
+                        ws_all_idx += 1
+                        ws_all = self._create_sheet_with_header_append(wb, "All", ws_all_idx, headers)
+                        ws_all_rows = 1
                     ws_all.append(row_out)
+                    ws_all_rows += 1
+
+                    if ws_f_rows >= max_rows:
+                        ws_f_idx += 1
+                        ws_f = self._create_sheet_with_header_append(wb, "摩擦力", ws_f_idx, f_header)
+                        ws_f_rows = 1
                     ws_f.append([t_str, fric_n, qf_val])
+                    ws_f_rows += 1
+
+                    if ws_mu_rows >= max_rows:
+                        ws_mu_idx += 1
+                        ws_mu = self._create_sheet_with_header_append(wb, "摩擦系数", ws_mu_idx, mu_header)
+                        ws_mu_rows = 1
                     ws_mu.append([t_str, mu, qf_val])
+                    ws_mu_rows += 1
 
                 done_rows += len(rows)
                 if progress_cb and total_rows is not None:
@@ -4758,6 +4970,36 @@ class MainWindow(QMainWindow):
                 pass
 
     def closeEvent(self, event):
+        try:
+            export_dialog = getattr(self, "_export_queue_dialog", None)
+            if export_dialog and export_dialog.is_exporting():
+                ret = QMessageBox.question(
+                    self,
+                    "确认退出",
+                    "检测到正在导出的项目。\n确认退出将强制结束所有软件相关进程，是否退出？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if ret != QMessageBox.Yes:
+                    event.ignore()
+                    return
+                try:
+                    export_dialog.force_stop_exports()
+                except Exception:
+                    pass
+            elif export_dialog:
+                try:
+                    export_dialog.force_stop_exports()
+                except Exception:
+                    pass
+            try:
+                import subprocess
+                pid = os.getpid()
+                subprocess.Popen(["taskkill", "/PID", str(pid), "/T", "/F"])
+            except Exception:
+                pass
+        except Exception:
+            pass
         # 持久化工作区布局（停靠位置/分割器尺寸/窗口几何）
         try:
             self._save_window_layout()
