@@ -4689,10 +4689,17 @@ class MainWindow(QMainWindow):
 
         headers = ["Time"]
         units = list(getattr(self, "_log_units", []))
+        avg_header = "平均张力(N【牛】)"
+        avg_inserted = False
         for idx, name in enumerate(self.channel_names):
             unit = units[idx] if idx < len(units) else ""
             unit_label = self._unit_label(unit)
             headers.append(f"{name}({unit_label})" if unit_label else name)
+            if name == "CH2":
+                headers.append(avg_header)
+                avg_inserted = True
+        if not avg_inserted:
+            headers.append(avg_header)
         headers += ["摩擦力(N【牛】)", "摩擦系数", self._quality_flag_label]
 
         ws_all_idx = 1
@@ -4716,13 +4723,10 @@ class MainWindow(QMainWindow):
             ws_all.cell(row=ws_all_row, column=1, value=t_str)
 
             row_vals = []
-            col_idx = 2
             for c, name in enumerate(self.channel_names, start=2):
                 col = ys_map.get(name, [])
                 v = col[i] if i < len(col) else None
                 row_vals.append(v)
-                ws_all.cell(row=ws_all_row, column=col_idx, value=v)
-                col_idx += 1
 
             high_v = None
             low_v = None
@@ -4736,6 +4740,22 @@ class MainWindow(QMainWindow):
                     low_v = row_vals[self.channel_names.index(lo_name)]
                 except Exception:
                     low_v = None
+            avg_v = self._calc_avg_tension(high_v, low_v)
+
+            col_idx = 2
+            avg_inserted = False
+            for c, name in enumerate(self.channel_names, start=2):
+                v = row_vals[c - 2] if (c - 2) < len(row_vals) else None
+                ws_all.cell(row=ws_all_row, column=col_idx, value=v)
+                col_idx += 1
+                if name == "CH2":
+                    ws_all.cell(row=ws_all_row, column=col_idx, value=avg_v)
+                    col_idx += 1
+                    avg_inserted = True
+            if not avg_inserted:
+                ws_all.cell(row=ws_all_row, column=col_idx, value=avg_v)
+                col_idx += 1
+
             fric_n, mu = self._calc_fric_mu(high_v, low_v)
             ws_all.cell(row=ws_all_row, column=col_idx, value=fric_n)
             ws_all.cell(row=ws_all_row, column=col_idx + 1, value=mu)
@@ -4783,14 +4803,18 @@ class MainWindow(QMainWindow):
                 ws_q.cell(row=row_idx, column=2, value=qv)
                 row_idx += 1
 
+        avg_header = ["Time", "平均张力(N【牛】)"]
         f_header = ["Time", "摩擦力(N【牛】)", self._quality_flag_label]
         mu_header = ["Time", "摩擦系数", self._quality_flag_label]
         ws_f_idx = 1
         ws_mu_idx = 1
+        ws_avg_idx = 1
         ws_f = self._create_sheet_with_header_cells(wb, "摩擦力", ws_f_idx, f_header)
         ws_mu = self._create_sheet_with_header_cells(wb, "摩擦系数", ws_mu_idx, mu_header)
+        ws_avg = self._create_sheet_with_header_cells(wb, "平均张力", ws_avg_idx, avg_header)
         ws_f_row = 2
         ws_mu_row = 2
+        ws_avg_row = 2
         for i, rel_ts in enumerate(xs):
             if ws_f_row > max_rows:
                 ws_f_idx += 1
@@ -4800,6 +4824,10 @@ class MainWindow(QMainWindow):
                 ws_mu_idx += 1
                 ws_mu = self._create_sheet_with_header_cells(wb, "摩擦系数", ws_mu_idx, mu_header)
                 ws_mu_row = 2
+            if ws_avg_row > max_rows:
+                ws_avg_idx += 1
+                ws_avg = self._create_sheet_with_header_cells(wb, "平均张力", ws_avg_idx, avg_header)
+                ws_avg_row = 2
             wall_ts = xs_wall[i] if xs_wall and i < len(xs_wall) else None
             t_str = self._format_export_time(wall_ts, rel_ts)
             fric_n = None
@@ -4819,8 +4847,12 @@ class MainWindow(QMainWindow):
             ws_mu.cell(row=ws_mu_row, column=1, value=t_str)
             ws_mu.cell(row=ws_mu_row, column=2, value=mu)
             ws_mu.cell(row=ws_mu_row, column=3, value=qf_v)
+            avg_v = self._calc_avg_tension(hv, lv)
+            ws_avg.cell(row=ws_avg_row, column=1, value=t_str)
+            ws_avg.cell(row=ws_avg_row, column=2, value=avg_v)
             ws_f_row += 1
             ws_mu_row += 1
+            ws_avg_row += 1
 
         for ws in wb.worksheets:
             self._autosize_sheet(ws)
@@ -4869,25 +4901,36 @@ class MainWindow(QMainWindow):
             wb = Workbook(write_only=True)
 
             headers = ["Time"]
+            avg_header = "平均张力(N【牛】)"
+            avg_inserted = False
             for idx, name in enumerate(channel_names):
                 if name == self._quality_flag_name:
                     continue
                 unit = channel_units[idx] if idx < len(channel_units) else ""
                 unit_label = self._unit_label(unit)
                 headers.append(f"{name}({unit_label})" if unit_label else name)
+                if name == "CH2":
+                    headers.append(avg_header)
+                    avg_inserted = True
+            if not avg_inserted:
+                headers.append(avg_header)
             headers += ["摩擦力(N【牛】)", "摩擦系数", self._quality_flag_label]
 
             ws_all_idx = 1
             ws_all = self._create_sheet_with_header_append(wb, "All", ws_all_idx, headers)
             ws_all_rows = 1
+            avg_header = ["Time", "平均张力(N【牛】)"]
             f_header = ["Time", "摩擦力(N【牛】)", self._quality_flag_label]
             mu_header = ["Time", "摩擦系数", self._quality_flag_label]
             ws_f_idx = 1
             ws_mu_idx = 1
+            ws_avg_idx = 1
             ws_f = self._create_sheet_with_header_append(wb, "摩擦力", ws_f_idx, f_header)
             ws_mu = self._create_sheet_with_header_append(wb, "摩擦系数", ws_mu_idx, mu_header)
+            ws_avg = self._create_sheet_with_header_append(wb, "平均张力", ws_avg_idx, avg_header)
             ws_f_rows = 1
             ws_mu_rows = 1
+            ws_avg_rows = 1
 
             hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
             lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
@@ -4909,12 +4952,19 @@ class MainWindow(QMainWindow):
                     low_v = vals[lo_idx] if (lo_idx is not None and lo_idx < len(vals)) else None
                     row_out = [t_str]
                     qf_val = None
+                    avg_v = self._calc_avg_tension(high_v, low_v)
+                    avg_inserted = False
                     for idx, name in enumerate(channel_names):
                         v = vals[idx] if idx < len(vals) else None
                         if name == self._quality_flag_name:
                             qf_val = v
                             continue
                         row_out.append(v)
+                        if name == "CH2":
+                            row_out.append(avg_v)
+                            avg_inserted = True
+                    if not avg_inserted:
+                        row_out.append(avg_v)
 
                     fric_n, mu = self._calc_fric_mu(high_v, low_v)
                     row_out += [fric_n, mu, qf_val]
@@ -4937,8 +4987,15 @@ class MainWindow(QMainWindow):
                         ws_mu_idx += 1
                         ws_mu = self._create_sheet_with_header_append(wb, "摩擦系数", ws_mu_idx, mu_header)
                         ws_mu_rows = 1
+                    if ws_avg_rows >= max_rows:
+                        ws_avg_idx += 1
+                        ws_avg = self._create_sheet_with_header_append(wb, "平均张力", ws_avg_idx, avg_header)
+                        ws_avg_rows = 1
                     ws_mu.append([t_str, mu, qf_val])
                     ws_mu_rows += 1
+                    avg_v = self._calc_avg_tension(high_v, low_v)
+                    ws_avg.append([t_str, avg_v])
+                    ws_avg_rows += 1
 
                 done_rows += len(rows)
                 if progress_cb and total_rows is not None:
