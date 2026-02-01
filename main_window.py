@@ -823,8 +823,10 @@ class MainWindow(QMainWindow):
         self._plot_y_by_channel: Dict[str, object] = {}  # 名称 -> np.ndarray 或列表
         self._fric_buf = None
         self._mu_buf = None
+        self._avg_buf = None
         self._fric_plot_y = None
         self._mu_plot_y = None
+        self._avg_plot_y = None
         self._qf_buf = None
         self._plot_seq = 0
 
@@ -1169,6 +1171,29 @@ class MainWindow(QMainWindow):
         self.mu_plot.showGrid(x=True, y=True, alpha=0.25)
         self.mu_curve = self.mu_plot.plot([], [], name="摩擦系数", pen=pg.mkPen(color=(0, 120, 220), width=2))
 
+        # ---- 平均张力曲线 ----
+        self.avg_plot = pg.PlotWidget()
+        try:
+            pi = self.avg_plot.getPlotItem()
+            try:
+                pi.setClipToView(True)
+            except Exception:
+                pass
+            try:
+                pi.setDownsampling(auto=True, mode="peak")
+            except Exception:
+                try:
+                    pi.setDownsampling(auto=True, method="peak")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.avg_plot.setLabel("bottom", "时间", units="s")
+        self.avg_plot.setLabel("left", "平均张力")
+        self.avg_plot.addLegend()
+        self.avg_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.avg_curve = self.avg_plot.plot([], [], name="平均张力", pen=pg.mkPen(color=(150, 70, 200), width=2))
+
         # ---- 绘图窗口（停靠面板） ----
         self.plot_tabs = QTabWidget()
         tension_tab = QWidget()
@@ -1289,6 +1314,22 @@ class MainWindow(QMainWindow):
         mu_layout.addLayout(mu_cfg)
         mu_layout.addWidget(self.mu_plot, 1)
 
+        self.avg_tab = QWidget()
+        avg_layout = QVBoxLayout(self.avg_tab)
+        avg_layout.setContentsMargins(0, 0, 0, 0)
+        avg_cfg = QGridLayout()
+        self.avg_high_combo = QComboBox()
+        self.avg_low_combo = QComboBox()
+        self.avg_swap_btn = QPushButton("互换")
+        avg_cfg.addWidget(QLabel("高张力侧"), 0, 0)
+        avg_cfg.addWidget(self.avg_high_combo, 0, 1)
+        avg_cfg.addWidget(QLabel("低张力侧"), 0, 2)
+        avg_cfg.addWidget(self.avg_low_combo, 0, 3)
+        avg_cfg.addWidget(self.avg_swap_btn, 0, 4)
+        avg_cfg.setColumnStretch(5, 1)
+        avg_layout.addLayout(avg_cfg)
+        avg_layout.addWidget(self.avg_plot, 1)
+
         self.plot_dock = QDockWidget("绘图窗口", self)
         try:
             self.plot_dock.setObjectName("dock_plot")
@@ -1318,6 +1359,9 @@ class MainWindow(QMainWindow):
         self.mu_max_spin_mu.valueChanged.connect(self._on_quality_mu_max_changed_mu)
         self.rmax_spin_mu.valueChanged.connect(self._on_quality_rmax_changed_mu)
         self.qgap_spin_mu.valueChanged.connect(self._on_quality_gap_timeout_changed_mu)
+        self.avg_high_combo.currentIndexChanged.connect(self._on_avg_config_changed)
+        self.avg_low_combo.currentIndexChanged.connect(self._on_avg_config_changed)
+        self.avg_swap_btn.clicked.connect(self._swap_avg_channels)
 
         # ---- 通讯监视器停靠面板 ----
         self.monitor_dock = QDockWidget("通讯监视窗口", self)
@@ -1694,6 +1738,11 @@ class MainWindow(QMainWindow):
         self.act_mu_plot.setCheckable(True)
         self.act_mu_plot.setChecked(False)
         self.act_mu_plot.toggled.connect(lambda on: self._set_plot_tab_visible(self.mu_tab, "摩擦系数", on))
+
+        self.act_avg_plot = plot_menu.addAction("平均张力绘图窗口")
+        self.act_avg_plot.setCheckable(True)
+        self.act_avg_plot.setChecked(False)
+        self.act_avg_plot.toggled.connect(lambda on: self._set_plot_tab_visible(self.avg_tab, "平均张力", on))
 
         # ---- 历史数据菜单 ----
         self.hist_menu = self.menuBar().addMenu("历史数据")
@@ -2269,8 +2318,14 @@ class MainWindow(QMainWindow):
         cur_low = self.fric_low_combo.currentText() if hasattr(self, "fric_low_combo") else ""
         cur_high_mu = self.mu_high_combo.currentText() if hasattr(self, "mu_high_combo") else ""
         cur_low_mu = self.mu_low_combo.currentText() if hasattr(self, "mu_low_combo") else ""
+        cur_high_avg = self.avg_high_combo.currentText() if hasattr(self, "avg_high_combo") else ""
+        cur_low_avg = self.avg_low_combo.currentText() if hasattr(self, "avg_low_combo") else ""
 
-        for combo in [self.fric_high_combo, self.fric_low_combo, getattr(self, "mu_high_combo", None), getattr(self, "mu_low_combo", None)]:
+        for combo in [
+            self.fric_high_combo, self.fric_low_combo,
+            getattr(self, "mu_high_combo", None), getattr(self, "mu_low_combo", None),
+            getattr(self, "avg_high_combo", None), getattr(self, "avg_low_combo", None),
+        ]:
             if combo is None:
                 continue
             try:
@@ -2301,6 +2356,10 @@ class MainWindow(QMainWindow):
                 self.mu_high_combo.setCurrentText(cur_high_mu)
             if cur_low_mu and cur_low_mu in names and hasattr(self, "mu_low_combo"):
                 self.mu_low_combo.setCurrentText(cur_low_mu)
+            if cur_high_avg and cur_high_avg in names and hasattr(self, "avg_high_combo"):
+                self.avg_high_combo.setCurrentText(cur_high_avg)
+            if cur_low_avg and cur_low_avg in names and hasattr(self, "avg_low_combo"):
+                self.avg_low_combo.setCurrentText(cur_low_avg)
         except Exception:
             pass
 
@@ -2334,6 +2393,20 @@ class MainWindow(QMainWindow):
             pass
         self._on_mu_config_changed()
 
+    def _swap_avg_channels(self):
+        try:
+            if not self.avg_high_combo.isEnabled() or not self.avg_low_combo.isEnabled():
+                return
+            hi = self.avg_high_combo.currentIndex()
+            lo = self.avg_low_combo.currentIndex()
+            if hi < 0 or lo < 0:
+                return
+            self.avg_high_combo.setCurrentIndex(lo)
+            self.avg_low_combo.setCurrentIndex(hi)
+        except Exception:
+            pass
+        self._on_avg_config_changed()
+
     def _sync_mu_from_fric(self):
         if not hasattr(self, "mu_high_combo"):
             return
@@ -2354,6 +2427,25 @@ class MainWindow(QMainWindow):
                 self.mu_high_combo.blockSignals(False)
                 self.mu_low_combo.blockSignals(False)
                 self.mu_wrap_angle_spin.blockSignals(False)
+            except Exception:
+                pass
+
+    def _sync_avg_from_fric(self):
+        if not hasattr(self, "avg_high_combo"):
+            return
+        try:
+            self.avg_high_combo.blockSignals(True)
+            self.avg_low_combo.blockSignals(True)
+            if self.avg_high_combo.isEnabled():
+                self.avg_high_combo.setCurrentText(self.fric_high_combo.currentText())
+            if self.avg_low_combo.isEnabled():
+                self.avg_low_combo.setCurrentText(self.fric_low_combo.currentText())
+        except Exception:
+            pass
+        finally:
+            try:
+                self.avg_high_combo.blockSignals(False)
+                self.avg_low_combo.blockSignals(False)
             except Exception:
                 pass
 
@@ -2380,6 +2472,25 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _sync_fric_from_avg(self):
+        if not hasattr(self, "fric_high_combo"):
+            return
+        try:
+            self.fric_high_combo.blockSignals(True)
+            self.fric_low_combo.blockSignals(True)
+            if self.fric_high_combo.isEnabled():
+                self.fric_high_combo.setCurrentText(self.avg_high_combo.currentText())
+            if self.fric_low_combo.isEnabled():
+                self.fric_low_combo.setCurrentText(self.avg_low_combo.currentText())
+        except Exception:
+            pass
+        finally:
+            try:
+                self.fric_high_combo.blockSignals(False)
+                self.fric_low_combo.blockSignals(False)
+            except Exception:
+                pass
+
     def _on_friction_config_changed(self, *args):
         try:
             self._fric_high_name = (self.fric_high_combo.currentText() or "").strip()
@@ -2399,6 +2510,7 @@ class MainWindow(QMainWindow):
         self._sync_quality_from_wrap()
 
         self._sync_mu_from_fric()
+        self._sync_avg_from_fric()
         self._recalc_friction_buffers()
         try:
             self._plot_seq = int(getattr(self, "_plot_seq", 0) or 0) + 1
@@ -2412,6 +2524,10 @@ class MainWindow(QMainWindow):
 
     def _on_mu_config_changed(self, *args):
         self._sync_fric_from_mu()
+        self._on_friction_config_changed()
+
+    def _on_avg_config_changed(self, *args):
+        self._sync_fric_from_avg()
         self._on_friction_config_changed()
 
     def _on_quality_rmin_changed(self, *args):
@@ -2585,28 +2701,47 @@ class MainWindow(QMainWindow):
                 mu = None
         return fric, mu
 
+    def _calc_avg_tension(self, high_v, low_v):
+        try:
+            if high_v is None or low_v is None:
+                return None
+            high = float(high_v)
+            low = float(low_v)
+        except Exception:
+            return None
+        try:
+            if not math.isfinite(high) or not math.isfinite(low):
+                return None
+        except Exception:
+            pass
+        return (high + low) / 2.0
+
     def _update_friction_buffers_at_index(self, idx: int, row: dict):
-        if self._fric_buf is None or self._mu_buf is None:
+        if self._fric_buf is None or self._mu_buf is None or self._avg_buf is None:
             return
         high_name = (getattr(self, "_fric_high_name", "") or "").strip()
         low_name = (getattr(self, "_fric_low_name", "") or "").strip()
         if (not high_name) or (not low_name):
             fric, mu = None, None
+            avg = None
         else:
             fric, mu = self._calc_fric_mu(row.get(high_name), row.get(low_name))
+            avg = self._calc_avg_tension(row.get(high_name), row.get(low_name))
         if np is not None:
             try:
                 self._fric_buf[idx] = (np.nan if fric is None else float(fric))
                 self._mu_buf[idx] = (np.nan if mu is None else float(mu))
+                self._avg_buf[idx] = (np.nan if avg is None else float(avg))
             except Exception:
                 pass
         else:
             self._fric_buf[idx] = fric
             self._mu_buf[idx] = mu
+            self._avg_buf[idx] = avg
 
     def _recalc_friction_buffers(self):
         size = int(getattr(self, "_buf_size", 0) or 0)
-        if size <= 0 or self._fric_buf is None or self._mu_buf is None:
+        if size <= 0 or self._fric_buf is None or self._mu_buf is None or self._avg_buf is None:
             return
         high_name = (getattr(self, "_fric_high_name", "") or "").strip()
         low_name = (getattr(self, "_fric_low_name", "") or "").strip()
@@ -2615,6 +2750,7 @@ class MainWindow(QMainWindow):
         for i in range(size):
             if high_buf is None or low_buf is None:
                 fric, mu = None, None
+                avg = None
             else:
                 try:
                     hv = high_buf[i]
@@ -2623,18 +2759,21 @@ class MainWindow(QMainWindow):
                     hv = None
                     lv = None
                 fric, mu = self._calc_fric_mu(hv, lv)
+                avg = self._calc_avg_tension(hv, lv)
             if np is not None:
                 try:
                     self._fric_buf[i] = (np.nan if fric is None else float(fric))
                     self._mu_buf[i] = (np.nan if mu is None else float(mu))
+                    self._avg_buf[i] = (np.nan if avg is None else float(avg))
                 except Exception:
                     pass
             else:
                 self._fric_buf[i] = fric
                 self._mu_buf[i] = mu
+                self._avg_buf[i] = avg
 
     def _update_friction_plots(self, xs, idx: int, full: bool, count: int, scroll_live: bool, x_left: float, x_right: float):
-        if xs is None or self._fric_buf is None or self._mu_buf is None:
+        if xs is None or self._fric_buf is None or self._mu_buf is None or self._avg_buf is None:
             return
         size = int(getattr(self, "_buf_size", 0) or 0)
         if size <= 0:
@@ -2650,6 +2789,10 @@ class MainWindow(QMainWindow):
                 self.mu_plot.setXRange(x_left, x_right, padding=0.0)
             except Exception:
                 pass
+            try:
+                self.avg_plot.setXRange(x_left, x_right, padding=0.0)
+            except Exception:
+                pass
 
         if np is not None:
             if full:
@@ -2658,15 +2801,21 @@ class MainWindow(QMainWindow):
                     self._fric_plot_y = np.empty(size, dtype=float)
                 if self._mu_plot_y is None or getattr(self._mu_plot_y, "shape", (0,))[0] != size:
                     self._mu_plot_y = np.empty(size, dtype=float)
+                if self._avg_plot_y is None or getattr(self._avg_plot_y, "shape", (0,))[0] != size:
+                    self._avg_plot_y = np.empty(size, dtype=float)
                 self._fric_plot_y[:first] = self._fric_buf[idx:]
                 self._fric_plot_y[first:] = self._fric_buf[:idx]
                 self._mu_plot_y[:first] = self._mu_buf[idx:]
                 self._mu_plot_y[first:] = self._mu_buf[:idx]
+                self._avg_plot_y[:first] = self._avg_buf[idx:]
+                self._avg_plot_y[first:] = self._avg_buf[:idx]
                 ys_fric = self._fric_plot_y
                 ys_mu = self._mu_plot_y
+                ys_avg = self._avg_plot_y
             else:
                 ys_fric = self._fric_buf[:count]
                 ys_mu = self._mu_buf[:count]
+                ys_avg = self._avg_buf[:count]
             try:
                 self.friction_curve.setData(xs, ys_fric, connect="finite", skipFiniteCheck=True)
             except Exception:
@@ -2681,15 +2830,25 @@ class MainWindow(QMainWindow):
                     self.mu_curve.setData(xs, ys_mu, connect="finite")
                 except Exception:
                     pass
+            try:
+                self.avg_curve.setData(xs, ys_avg, connect="finite", skipFiniteCheck=True)
+            except Exception:
+                try:
+                    self.avg_curve.setData(xs, ys_avg, connect="finite")
+                except Exception:
+                    pass
         else:
             if full:
                 fric_raw = list(self._fric_buf[idx:]) + list(self._fric_buf[:idx])
                 mu_raw = list(self._mu_buf[idx:]) + list(self._mu_buf[:idx])
+                avg_raw = list(self._avg_buf[idx:]) + list(self._avg_buf[:idx])
             else:
                 fric_raw = list(self._fric_buf[:count])
                 mu_raw = list(self._mu_buf[:count])
+                avg_raw = list(self._avg_buf[:count])
             xs_f, ys_f = [], []
             xs_m, ys_m = [], []
+            xs_a, ys_a = [], []
             for t, v in zip(xs, fric_raw):
                 if v is None:
                     continue
@@ -2700,12 +2859,21 @@ class MainWindow(QMainWindow):
                     continue
                 xs_m.append(t)
                 ys_m.append(v)
+            for t, v in zip(xs, avg_raw):
+                if v is None:
+                    continue
+                xs_a.append(t)
+                ys_a.append(v)
             try:
                 self.friction_curve.setData(xs_f, ys_f)
             except Exception:
                 pass
             try:
                 self.mu_curve.setData(xs_m, ys_m)
+            except Exception:
+                pass
+            try:
+                self.avg_curve.setData(xs_a, ys_a)
             except Exception:
                 pass
 
@@ -2717,6 +2885,7 @@ class MainWindow(QMainWindow):
         try:
             self.friction_plot.enableAutoRange(axis="y", enable=auto)
             self.mu_plot.enableAutoRange(axis="y", enable=auto)
+            self.avg_plot.enableAutoRange(axis="y", enable=auto)
         except Exception:
             pass
     def _flush_plot(self):
@@ -2815,13 +2984,17 @@ class MainWindow(QMainWindow):
         if np is not None:
             self._fric_buf = np.full(size, np.nan, dtype=float)
             self._mu_buf = np.full(size, np.nan, dtype=float)
+            self._avg_buf = np.full(size, np.nan, dtype=float)
             self._fric_plot_y = np.empty(size, dtype=float)
             self._mu_plot_y = np.empty(size, dtype=float)
+            self._avg_plot_y = np.empty(size, dtype=float)
         else:
             self._fric_buf = [None] * size
             self._mu_buf = [None] * size
+            self._avg_buf = [None] * size
             self._fric_plot_y = None
             self._mu_plot_y = None
+            self._avg_plot_y = None
         if np is not None:
             self._qf_buf = np.full(size, np.nan, dtype=float)
         else:
@@ -2892,25 +3065,30 @@ class MainWindow(QMainWindow):
                     tail_low = tail_low[-k:] if tail_low else [None] * k
                     for j in range(k):
                         fric, mu = self._calc_fric_mu(tail_high[j], tail_low[j])
+                        avg = self._calc_avg_tension(tail_high[j], tail_low[j])
                         if np is not None:
                             try:
                                 self._fric_buf[j] = (np.nan if fric is None else float(fric))
                                 self._mu_buf[j] = (np.nan if mu is None else float(mu))
+                                self._avg_buf[j] = (np.nan if avg is None else float(avg))
                             except Exception:
                                 pass
                         else:
                             self._fric_buf[j] = fric
                             self._mu_buf[j] = mu
+                            self._avg_buf[j] = avg
                 else:
                     if np is not None:
                         try:
                             self._fric_buf[:k] = np.nan
                             self._mu_buf[:k] = np.nan
+                            self._avg_buf[:k] = np.nan
                         except Exception:
                             pass
                     else:
                         self._fric_buf[:k] = [None] * k
                         self._mu_buf[:k] = [None] * k
+                        self._avg_buf[:k] = [None] * k
                 self._buf_count = k
                 self._buf_idx = k % size
 
@@ -3884,6 +4062,8 @@ class MainWindow(QMainWindow):
                 self.friction_curve.setData([], [])
             if hasattr(self, "mu_curve") and self.mu_curve is not None:
                 self.mu_curve.setData([], [])
+            if hasattr(self, "avg_curve") and self.avg_curve is not None:
+                self.avg_curve.setData([], [])
         except Exception:
             pass
         self.set_status("已清空数据")
@@ -4014,6 +4194,10 @@ class MainWindow(QMainWindow):
                     pass
                 try:
                     self.mu_plot.setXRange(x_left, x_right, padding=0.0)
+                except Exception:
+                    pass
+                try:
+                    self.avg_plot.setXRange(x_left, x_right, padding=0.0)
                 except Exception:
                     pass
             return
