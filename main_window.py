@@ -1,44 +1,19 @@
 # -*- coding: utf-8 -*-
 """Modbus 助手主界面窗口。"""
 
-import math
-import concurrent.futures
 import os
-import sqlite3
-import time
-import threading
-import tempfile
-import zipfile
-import unicodedata
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pyqtgraph as pg
-from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
-
-import serial
-from serial.tools import list_ports
-
-from openpyxl import Workbook, load_workbook
-from openpyxl.utils import get_column_letter
-
-# 可选：numpy 在高采样率下可加速绘图
-try:
-    import numpy as np
-except Exception:  # pragma: no cover
-    np = None
 
 from qt_compat import (
-    Qt, QThread, Signal, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit,
+    Qt, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit,
     QSpinBox, QDoubleSpinBox, QCheckBox, QHBoxLayout, QVBoxLayout, QGridLayout,
-    QGroupBox, QTableWidget, QTableWidgetItem, QMessageBox, QFileDialog,
-    QHeaderView, QDockWidget, QTabWidget, QTextEdit, QPlainTextEdit, QSplitter,
-    QSizePolicy, QTimer, QSettings, QPoint, QTextCursor, QGuiApplication, QApplication,
-    Slot, QDialog, QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox, QProgressBar,
+    QGroupBox, QTableWidget, QHeaderView, QDockWidget, QTabWidget, QPlainTextEdit,
+    QSplitter, QTimer, QSettings,
 )
 
-from modbus_utils import ChannelConfig, DTYPE_INFO, hex_bytes
-from rs485 import Rs485CtrlConfig, Rs485CtrlMode
-from virtual_serial import SIM_REGISTRY
+from rs485 import Rs485CtrlMode
 from worker import ModbusRtuWorker
 from sim_window import SerialSimManagerWindow
 from data_logger import DataLogger

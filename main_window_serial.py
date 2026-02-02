@@ -2,14 +2,11 @@
 """Serial connection and acquisition helpers for MainWindow."""
 
 from typing import List, Optional
-
-import serial
 from serial.tools import list_ports
 
 from qt_compat import QMessageBox, Slot
 
-from modbus_utils import ChannelConfig
-from rs485 import Rs485CtrlConfig, Rs485CtrlMode
+from rs485 import Rs485CtrlConfig
 from virtual_serial import SIM_REGISTRY
 from worker import ModbusRtuWorker
 from sim_window import SerialSimManagerWindow

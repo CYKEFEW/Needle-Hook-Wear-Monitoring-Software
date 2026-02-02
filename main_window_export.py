@@ -11,7 +11,7 @@ import time
 import unicodedata
 import zipfile
 
-from typing import Dict, List, Optional
+from typing import List
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
