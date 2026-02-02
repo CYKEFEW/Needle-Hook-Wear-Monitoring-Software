@@ -595,10 +595,16 @@ class ExportQueueDialog(QDialog):
         info["done"] = max(0, int(done))
         if total is not None and int(total) > 0:
             info["total"] = int(total)
-        if info.get("pending_finish") and (not info.get("finish_mode")):
-            if info.get("total", 0) > 0 and info.get("done", 0) >= info.get("total", 0):
-                info["finish_mode"] = True
-                info["finish_start_ts"] = time.time()
+        if info.get("pending_finish"):
+            if (not info.get("finish_mode")):
+                if info.get("total", 0) > 0 and info.get("done", 0) >= info.get("total", 0):
+                    info["finish_mode"] = True
+                    info["finish_start_ts"] = time.time()
+            if info.get("status") not in ("完成", "失败", "收尾中"):
+                info["status"] = "收尾中"
+                status_item = self.table.item(info["row"], 1)
+                if status_item:
+                    status_item.setText("收尾中")
         self._update_row_progress(db_path)
 
     def _on_task_status(self, db_path, status):
@@ -606,6 +612,10 @@ class ExportQueueDialog(QDialog):
         if not info:
             return
         info["status"] = status
+        if status in ("完成", "失败"):
+            info["pending_finish"] = False
+            info["finish_mode"] = False
+            info["finish_start_ts"] = None
         row = info["row"]
         item = self.table.item(row, 1)
         if item:
@@ -634,9 +644,11 @@ class ExportQueueDialog(QDialog):
                 if not info.get("finish_mode"):
                     info["finish_mode"] = True
                     info["finish_start_ts"] = time.time()
-            status_item = self.table.item(info["row"], 1)
-            if status_item:
-                status_item.setText("收尾中")
+            if info.get("status") not in ("完成", "失败"):
+                info["status"] = "收尾中"
+                status_item = self.table.item(info["row"], 1)
+                if status_item:
+                    status_item.setText("收尾中")
         self._update_overall_status()
 
     def _on_finished(self, ok_paths, failed_paths, zip_path):
@@ -759,17 +771,35 @@ class ExportQueueDialog(QDialog):
             if force:
                 self.status_label.setText("状态：空闲")
             return
-        statuses = [info.get("status", "") for info in self._task_info.values()]
-        if any(s == "导出中" for s in statuses):
+        infos = list(self._task_info.values())
+        has_exporting = False
+        has_finishing = False
+        has_failed = False
+        all_done = True
+        for info in infos:
+            status = info.get("status", "")
+            if status != "完成":
+                all_done = False
+            if status == "失败":
+                has_failed = True
+            finishing = status == "收尾中" or (
+                (info.get("pending_finish") or info.get("finish_mode"))
+                and status not in ("完成", "失败")
+            )
+            if finishing:
+                has_finishing = True
+            if status == "导出中" and (not finishing):
+                has_exporting = True
+        if has_exporting:
             self.status_label.setText("状态：导出中")
             return
-        if any(s == "收尾中" for s in statuses) or any(info.get("finish_mode") for info in self._task_info.values()):
+        if has_finishing:
             self.status_label.setText("状态：收尾中")
             return
-        if all(s == "完成" for s in statuses):
+        if all_done:
             self.status_label.setText("状态：完成")
             return
-        if any(s == "失败" for s in statuses):
+        if has_failed:
             self.status_label.setText("状态：失败")
             return
 
