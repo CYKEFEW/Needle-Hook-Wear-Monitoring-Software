@@ -290,6 +290,8 @@ class MainWindow(ExportMixin, LayoutMixin, MonitorMixin, PlotMixin, ChannelMixin
 
         self.save_btn = QPushButton("保存为 XLSX")
         self.save_btn.clicked.connect(lambda *_: self.save_xlsx())
+        self.save_db_btn = QPushButton("保存为标准 DB")
+        self.save_db_btn.clicked.connect(lambda *_: self.save_standard_db())
 
         pgd.addWidget(QLabel("当前窗口最大点数"), 0, 0)
         pgd.addWidget(self.max_points_spin, 0, 1)
@@ -298,6 +300,7 @@ class MainWindow(ExportMixin, LayoutMixin, MonitorMixin, PlotMixin, ChannelMixin
         pgd.addWidget(self.autoscale_chk, 2, 0, 1, 2)
         pgd.addWidget(self.clear_btn, 3, 0)
         pgd.addWidget(self.save_btn, 3, 1)
+        pgd.addWidget(self.save_db_btn, 4, 0, 1, 2)
 
         # ---- 通道分组 ----
         ch_box = QGroupBox("通道配置（多通道）")

@@ -23,17 +23,36 @@ from qt_compat import (
     QDialogButtonBox, QProgressBar, QPushButton,
 )
 
+STANDARD_DB_CREATE_SQL = (
+    'CREATE TABLE "Data" (\n'
+    '"t_s" REAL,\n'
+    '  "t_high_N" REAL,\n'
+    '  "t_low_N" REAL,\n'
+    '  "t_avg_N" REAL,\n'
+    '  "f_fric_N" REAL,\n'
+    '  "mu" REAL,\n'
+    '  "quality_flag" INTEGER\n'
+    ')'
+)
+
+STANDARD_DB_INSERT_SQL = (
+    'INSERT INTO "Data" '
+    '("t_s", "t_high_N", "t_low_N", "t_avg_N", "f_fric_N", "mu", "quality_flag") '
+    'VALUES (?, ?, ?, ?, ?, ?, ?)'
+)
+
 class HistoryDbDialog(QDialog):
-    def __init__(self, parent, data_dir: str, export_cb):
+    def __init__(self, parent, data_dir: str, export_cb=None, export_standard_cb=None):
         super().__init__(parent)
         self._data_dir = data_dir
         self._export_cb = export_cb
+        self._export_standard_cb = export_standard_cb
         self._bulk_updating = False
         self.setWindowTitle("管理数据库")
         self.resize(620, 460)
 
         root = QVBoxLayout(self)
-        info = QLabel("管理历史数据库，可导出或删除。")
+        info = QLabel("管理历史数据库，可导出为 XLSX、标准 DB 或删除。")
         root.addWidget(info)
 
         top_row = QHBoxLayout()
@@ -52,17 +71,20 @@ class HistoryDbDialog(QDialog):
 
         btns = QDialogButtonBox()
         self.btn_refresh = QPushButton("刷新")
-        self.btn_export = QPushButton("导出")
+        self.btn_export = QPushButton("导出 XLSX")
+        self.btn_export_standard = QPushButton("导出标准 DB")
         self.btn_delete = QPushButton("删除")
         self.btn_close = QPushButton("关闭")
         btns.addButton(self.btn_refresh, QDialogButtonBox.ActionRole)
         btns.addButton(self.btn_export, QDialogButtonBox.AcceptRole)
+        btns.addButton(self.btn_export_standard, QDialogButtonBox.AcceptRole)
         btns.addButton(self.btn_delete, QDialogButtonBox.DestructiveRole)
         btns.addButton(self.btn_close, QDialogButtonBox.RejectRole)
         root.addWidget(btns)
 
         self.btn_refresh.clicked.connect(self.reload)
         self.btn_export.clicked.connect(self.export_selected)
+        self.btn_export_standard.clicked.connect(self.export_selected_standard_db)
         self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_close.clicked.connect(self.reject)
         self.list.itemDoubleClicked.connect(lambda *_: self.export_selected())
@@ -197,11 +219,20 @@ class HistoryDbDialog(QDialog):
         if not paths:
             QMessageBox.information(self, "提示", "请先选择要导出的数据库。")
             return
-        parent = self.parent()
-        if parent and hasattr(parent, "queue_export_db_paths"):
-            parent.queue_export_db_paths(paths)
+        if callable(self._export_cb):
+            self._export_cb(paths)
             return
         QMessageBox.warning(self, "提示", "无法导出，请在主界面操作。")
+
+    def export_selected_standard_db(self):
+        paths = self._get_action_paths()
+        if not paths:
+            QMessageBox.information(self, "提示", "请先选择要导出的数据库。")
+            return
+        if callable(self._export_standard_cb):
+            self._export_standard_cb(paths)
+            return
+        QMessageBox.warning(self, "提示", "无法导出标准 DB，请在主界面操作。")
 
     def delete_selected(self):
         paths = self._get_action_paths()
@@ -229,12 +260,13 @@ class ExportQueueWorker(QThread):
     error = Signal(str, str)
     finished = Signal(list, list, str)
 
-    def __init__(self, tasks, export_func, max_workers=8, zip_path=""):
+    def __init__(self, tasks, export_func, max_workers=8, zip_path="", default_export_ext=".xlsx"):
         super().__init__()
         self._tasks = tasks or []
         self._export_func = export_func
         self._max_workers = max(1, int(max_workers))
         self._zip_path = zip_path or ""
+        self._default_export_ext = default_export_ext or ".xlsx"
         self._cancel_event = threading.Event()
         self._pause_event = threading.Event()
 
@@ -317,7 +349,7 @@ class ExportQueueWorker(QThread):
                     continue
                 db_path = task.get("db_path") or ""
                 base = os.path.splitext(os.path.basename(db_path))[0]
-                task["out_path"] = os.path.join(tmp_ctx.name, base + ".xlsx")
+                task["out_path"] = os.path.join(tmp_ctx.name, base + self._default_export_ext)
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as ex:
@@ -358,9 +390,10 @@ class ExportQueueWorker(QThread):
 
 
 class ExportQueueDialog(QDialog):
-    def __init__(self, parent, export_func):
+    def __init__(self, parent, export_func, default_export_ext=".xlsx"):
         super().__init__(parent)
         self._export_func = export_func
+        self._default_export_ext = default_export_ext or ".xlsx"
         self._tasks = []
         self._task_info = {}
         self._worker = None
@@ -553,7 +586,13 @@ class ExportQueueDialog(QDialog):
             info["finish_start_ts"] = None
         self.thread_spin.setEnabled(False)
 
-        self._worker = ExportQueueWorker(self._tasks, self._export_func, self.thread_spin.value(), self._zip_path)
+        self._worker = ExportQueueWorker(
+            self._tasks,
+            self._export_func,
+            self.thread_spin.value(),
+            self._zip_path,
+            self._default_export_ext,
+        )
         self._worker.progress.connect(self._on_task_progress)
         self._worker.status.connect(self._on_task_status)
         self._worker.phase.connect(self._on_phase)
@@ -1197,6 +1236,174 @@ class ExportMixin:
         except Exception:
             pass
 
+    def _load_logged_channel_rows(self, conn):
+        try:
+            cur = conn.execute("SELECT idx, name, unit FROM channels ORDER BY idx")
+            rows = cur.fetchall()
+            return [row[1] for row in rows], [row[2] if len(row) > 2 else "" for row in rows]
+        except Exception:
+            cur = conn.execute("SELECT idx, name FROM channels ORDER BY idx")
+            rows = cur.fetchall()
+            return [row[1] for row in rows], ["" for _ in rows]
+
+    def _coerce_quality_flag(self, value) -> int:
+        try:
+            return 1 if int(round(float(value))) != 0 else 0
+        except Exception:
+            return 0
+
+    def _default_standard_db_path(self, base_path: str) -> str:
+        base_dir = os.path.dirname(base_path) or os.path.join(os.getcwd(), "data_logs")
+        base_name = os.path.splitext(os.path.basename(base_path))[0] or "modbus_data"
+        if not base_name.endswith("_sim"):
+            base_name += "_sim"
+        return os.path.join(base_dir, f"{base_name}.db")
+
+    def _open_standard_db(self, path: str):
+        out_path = os.path.abspath(path)
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        conn = sqlite3.connect(out_path)
+        conn.execute(STANDARD_DB_CREATE_SQL)
+        conn.commit()
+        return conn
+
+    def _build_standard_db_row(self, rel_ts, high_v, low_v, quality_flag):
+        rel_ts_val = self._safe_float(rel_ts)
+        if rel_ts_val is not None:
+            rel_ts_val = round(float(rel_ts_val), 2)
+        high_val = self._safe_float(high_v)
+        low_val = self._safe_float(low_v)
+        avg_val = self._calc_avg_tension(high_val, low_val)
+        fric_n, mu = self._calc_fric_mu(high_val, low_val)
+        return (
+            rel_ts_val,
+            high_val,
+            low_val,
+            avg_val,
+            fric_n,
+            mu,
+            self._coerce_quality_flag(quality_flag),
+        )
+
+    def _flush_standard_db_batch(self, cur, conn, batch):
+        if not batch:
+            return
+        cur.executemany(STANDARD_DB_INSERT_SQL, batch)
+        conn.commit()
+
+    def _export_standard_db_from_ring(self, path: str, xs, ys_map, qf_vals=None):
+        hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
+        lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
+
+        out_conn = self._open_standard_db(path)
+        try:
+            cur = out_conn.cursor()
+            batch = []
+            for idx, rel_ts in enumerate(xs):
+                high_v = ys_map.get(hi_name, [None])[idx] if hi_name and idx < len(ys_map.get(hi_name, [])) else None
+                low_v = ys_map.get(lo_name, [None])[idx] if lo_name and idx < len(ys_map.get(lo_name, [])) else None
+                qf_val = qf_vals[idx] if qf_vals is not None and idx < len(qf_vals) else 0
+                batch.append(self._build_standard_db_row(rel_ts, high_v, low_v, qf_val))
+                if len(batch) >= 2000:
+                    self._flush_standard_db_batch(cur, out_conn, batch)
+                    batch = []
+            self._flush_standard_db_batch(cur, out_conn, batch)
+        finally:
+            out_conn.close()
+
+    def _export_standard_db_from_db(self, db_path: str, path: str, progress_cb=None, progress_ctx=None, phase_cb=None):
+        try:
+            if self._data_logger:
+                self._data_logger.flush(wait=True, timeout=3.0)
+        except Exception:
+            pass
+
+        if os.path.abspath(db_path) == os.path.abspath(path):
+            raise ValueError("导出路径不能与源数据库相同。")
+
+        src_conn = sqlite3.connect(db_path)
+        total_rows = None
+        if progress_cb:
+            try:
+                total_rows = src_conn.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+                if total_rows is None:
+                    total_rows = 0
+            except Exception:
+                total_rows = None
+            try:
+                if total_rows is not None:
+                    total_rows = max(1, int(total_rows))
+                    progress_cb(progress_ctx, 0, total_rows)
+            except Exception:
+                pass
+
+        out_conn = None
+        try:
+            channel_names, _channel_units = self._load_logged_channel_rows(src_conn)
+            n_ch = len(channel_names)
+            col_names = [f"ch{i}" for i in range(n_ch)]
+            cols_sql = ", ".join(["ts"] + col_names) if col_names else "ts"
+            query = f"SELECT {cols_sql} FROM data ORDER BY id"
+
+            hi_name = (getattr(self, "_fric_high_name", "") or "").strip()
+            lo_name = (getattr(self, "_fric_low_name", "") or "").strip()
+            name_to_idx = {name: i for i, name in enumerate(channel_names)}
+            hi_idx = name_to_idx.get(hi_name, None)
+            lo_idx = name_to_idx.get(lo_name, None)
+            qf_idx = name_to_idx.get(self._quality_flag_name, None)
+
+            out_conn = self._open_standard_db(path)
+            out_cur = out_conn.cursor()
+            src_cur = src_conn.execute(query)
+            batch = []
+            done_rows = 0
+            base_ts = None
+
+            while True:
+                rows = src_cur.fetchmany(1000)
+                if not rows:
+                    break
+
+                for row in rows:
+                    ts_val = self._safe_float(row[0])
+                    if ts_val is not None and base_ts is None:
+                        base_ts = ts_val
+                    rel_ts = None if ts_val is None or base_ts is None else max(0.0, float(ts_val) - float(base_ts))
+                    vals = list(row[1:]) if n_ch > 0 else []
+                    high_v = vals[hi_idx] if hi_idx is not None and hi_idx < len(vals) else None
+                    low_v = vals[lo_idx] if lo_idx is not None and lo_idx < len(vals) else None
+                    qf_val = vals[qf_idx] if qf_idx is not None and qf_idx < len(vals) else 0
+                    batch.append(self._build_standard_db_row(rel_ts, high_v, low_v, qf_val))
+
+                self._flush_standard_db_batch(out_cur, out_conn, batch)
+                batch = []
+                done_rows += len(rows)
+                if progress_cb and total_rows is not None:
+                    try:
+                        progress_cb(progress_ctx, done_rows, total_rows)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                src_conn.close()
+            except Exception:
+                pass
+            if out_conn is not None:
+                try:
+                    out_conn.close()
+                except Exception:
+                    pass
+
+        try:
+            if phase_cb:
+                phase_cb("收尾中")
+        except Exception:
+            pass
+
     def export_history_db(self):
         data_dir = os.path.join(os.getcwd(), "data_logs")
         if not os.path.isdir(data_dir):
@@ -1220,7 +1427,12 @@ class ExportMixin:
     def open_history_dialog(self):
         data_dir = os.path.join(os.getcwd(), "data_logs")
         if not hasattr(self, "_history_db_dialog") or self._history_db_dialog is None:
-            self._history_db_dialog = HistoryDbDialog(self, data_dir, self._export_history_db_path)
+            self._history_db_dialog = HistoryDbDialog(
+                self,
+                data_dir,
+                self.queue_export_db_paths,
+                self.queue_standard_db_paths,
+            )
         else:
             try:
                 self._history_db_dialog._data_dir = data_dir
@@ -1240,6 +1452,15 @@ class ExportMixin:
             self._export_queue_dialog = ExportQueueDialog(self, self._export_xlsx_from_db)
         return self._export_queue_dialog
 
+    def _get_standard_db_export_queue_dialog(self):
+        if not hasattr(self, "_standard_db_export_queue_dialog") or self._standard_db_export_queue_dialog is None:
+            self._standard_db_export_queue_dialog = ExportQueueDialog(
+                self,
+                self._export_standard_db_from_db,
+                default_export_ext=".db",
+            )
+        return self._standard_db_export_queue_dialog
+
     def open_export_queue_dialog(self):
         dlg = self._get_export_queue_dialog()
         dlg.show()
@@ -1248,6 +1469,42 @@ class ExportMixin:
             dlg.activateWindow()
         except Exception:
             pass
+
+    def open_standard_db_export_queue_dialog(self):
+        dlg = self._get_standard_db_export_queue_dialog()
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_export_out_path(path: str, selected_filter: str = ""):
+        out_path = (path or "").strip()
+        selected = (selected_filter or "").lower()
+        lower = out_path.lower()
+        if lower.endswith(".db"):
+            return out_path, "db"
+        if lower.endswith(".xlsx"):
+            return out_path, "xlsx"
+        if "*.db" in selected or "sqlite" in selected:
+            return out_path + ".db", "db"
+        return out_path + ".xlsx", "xlsx"
+
+    def _enqueue_single_export_task(self, db_path: str, out_path: str, export_kind: str):
+        tasks = [{"db_path": db_path, "out_path": out_path}]
+        if export_kind == "db":
+            dlg = self._get_standard_db_export_queue_dialog()
+        else:
+            dlg = self._get_export_queue_dialog()
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+        dlg.enqueue_exports(tasks)
 
     def queue_export_db_paths(self, db_paths: List[str]):
         if not db_paths:
@@ -1299,6 +1556,54 @@ class ExportMixin:
             pass
         dlg.enqueue_exports(tasks, zip_path=zip_path)
 
+    def queue_standard_db_paths(self, db_paths: List[str]):
+        if not db_paths:
+            return
+
+        if len(db_paths) == 1:
+            db_path = db_paths[0]
+            out_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "导出为标准 DB",
+                self._default_standard_db_path(db_path),
+                "SQLite DB (*.db)"
+            )
+            if not out_path:
+                return
+            if not out_path.lower().endswith(".db"):
+                out_path += ".db"
+            tasks = [{"db_path": db_path, "out_path": out_path}]
+            dlg = self._get_standard_db_export_queue_dialog()
+            dlg.show()
+            try:
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+            dlg.enqueue_exports(tasks)
+            return
+
+        default_dir = os.path.dirname(db_paths[0]) or os.path.join(os.getcwd(), "data_logs")
+        zip_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出标准 DB 压缩包",
+            os.path.join(default_dir, "history_standard_databases.zip"),
+            "Zip Files (*.zip)"
+        )
+        if not zip_path:
+            return
+        if not zip_path.lower().endswith(".zip"):
+            zip_path += ".zip"
+        tasks = [{"db_path": p, "out_path": ""} for p in db_paths]
+        dlg = self._get_standard_db_export_queue_dialog()
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+        dlg.enqueue_exports(tasks, zip_path=zip_path)
+
     def _build_history_menu(self):
         if not hasattr(self, "hist_menu") or self.hist_menu is None:
             return
@@ -1311,6 +1616,8 @@ class ExportMixin:
         act_pick.triggered.connect(self.open_history_dialog)
         act_queue = self.hist_menu.addAction("导出队列")
         act_queue.triggered.connect(self.open_export_queue_dialog)
+        act_std_queue = self.hist_menu.addAction("标准 DB 导出队列")
+        act_std_queue.triggered.connect(self.open_standard_db_export_queue_dialog)
 
 
         self.hist_menu.addSeparator()
@@ -1357,7 +1664,19 @@ class ExportMixin:
         if not db_path or not os.path.isfile(db_path):
             QMessageBox.warning(self, "提示", "数据库文件不存在。")
             return
-        self.queue_export_db_paths([db_path])
+        base = os.path.splitext(os.path.basename(db_path))[0]
+        default_dir = os.path.dirname(db_path) or os.path.join(os.getcwd(), "data_logs")
+        default_name = os.path.join(default_dir, f"{base}.xlsx")
+        out_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出历史数据库",
+            default_name,
+            "Excel Files (*.xlsx);;SQLite DB (*.db)"
+        )
+        if not out_path:
+            return
+        out_path, export_kind = self._normalize_export_out_path(out_path, selected_filter)
+        self._enqueue_single_export_task(db_path, out_path, export_kind)
 
     def save_xlsx(self):
         db_path = self._log_db_path if getattr(self, "_log_db_path", "") else ""
@@ -1402,6 +1721,50 @@ class ExportMixin:
             self.set_status(f"已保存：{path}")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存 xlsx 失败：\n{e}")
+
+    def save_standard_db(self):
+        db_path = self._log_db_path if getattr(self, "_log_db_path", "") else ""
+        use_db = self._db_has_data(db_path)
+
+        xs = []
+        ys_map = {}
+        if not use_db:
+            xs, ys_map, _xs_wall, qf_vals = self._snapshot_ring(include_wall=True, include_quality=True)
+            if not xs or not self.channel_names:
+                QMessageBox.information(self, "提示", "当前没有可保存的数据。请先开始采集。")
+                return
+
+        default_path = self._default_standard_db_path(db_path or os.path.join(os.getcwd(), "modbus_data.db"))
+        path, _ = QFileDialog.getSaveFileName(self, "保存为标准 DB", default_path, "SQLite DB (*.db)")
+        if not path:
+            return
+        if not path.lower().endswith(".db"):
+            path += ".db"
+
+        try:
+            if use_db:
+                dlg = self._get_standard_db_export_queue_dialog()
+                dlg.show()
+                try:
+                    dlg.raise_()
+                    dlg.activateWindow()
+                except Exception:
+                    pass
+                tasks = [{"db_path": db_path, "out_path": path}]
+                dlg.enqueue_exports(tasks)
+            else:
+                self._export_standard_db_from_ring(path, xs, ys_map, qf_vals=qf_vals)
+                dlg = self._get_standard_db_export_queue_dialog()
+                dlg.show()
+                try:
+                    dlg.raise_()
+                    dlg.activateWindow()
+                except Exception:
+                    pass
+                dlg.show_completed_task(path)
+            self.set_status(f"已保存：{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"保存标准 DB 失败：\n{e}")
 
     @staticmethod
     def _safe_sheet_name(name: str) -> str:
