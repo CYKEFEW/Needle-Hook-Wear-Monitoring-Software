@@ -1,6 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 import struct
+from pathlib import Path
+
+from PyInstaller.utils.hooks.qt import pyqt5_library_info
 
 
 APP_NAME = "needle_hook_wear_monitor"
@@ -13,16 +17,48 @@ if struct.calcsize("P") * 8 != 32:
     )
 
 
+def _fix_pyqt5_qt_paths():
+    package_location = Path(pyqt5_library_info.package_location)
+    qt_root = package_location / "Qt5"
+    if not qt_root.is_dir():
+        return
+
+    path_overrides = {
+        "ArchDataPath": qt_root,
+        "BinariesPath": qt_root / "bin",
+        "DataPath": qt_root,
+        "DocumentationPath": qt_root / "doc",
+        "ExamplesPath": qt_root / "examples",
+        "HeadersPath": qt_root / "include",
+        "ImportsPath": qt_root / "imports",
+        "LibrariesPath": qt_root / "lib",
+        "LibraryExecutablesPath": qt_root / "bin",
+        "PluginsPath": qt_root / "plugins",
+        "PrefixPath": qt_root,
+        "Qml2ImportsPath": qt_root / "qml",
+        "TestsPath": qt_root / "tests",
+        "TranslationsPath": qt_root / "translations",
+    }
+
+    for key, value in path_overrides.items():
+        pyqt5_library_info.location[key] = os.fspath(value)
+
+    pyqt5_library_info.qt_lib_dir = Path(pyqt5_library_info.location["BinariesPath"]).resolve()
+
+
+_fix_pyqt5_qt_paths()
+
+
 a = Analysis(
     ["app.py"],
     pathex=["."],
     binaries=[],
     datas=[("app.ico", ".")],
-    hiddenimports=["PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets"],
+    hiddenimports=["PyQt5.QtOpenGL"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["PyQt5"],
+    excludes=["PySide6"],
     noarchive=False,
     optimize=0,
 )
