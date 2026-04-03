@@ -5,3 +5,4 @@ __pycache__/
 Instruction Manual/
 上位机软件.code-workspace
 SampleData/
+.venv/

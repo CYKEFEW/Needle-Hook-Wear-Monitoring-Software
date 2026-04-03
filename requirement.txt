@@ -1,0 +1,12 @@
+# Recommended for 32-bit Windows packaging:
+# - use stable CPython 3.12 32-bit
+# - prefer PyQt5 because PySide6 does not provide win32 wheels on PyPI
+
+pyinstaller
+PyQt5
+pyqtgraph
+pyserial
+openpyxl
+
+# Optional for 64-bit environments only:
+# PySide6
