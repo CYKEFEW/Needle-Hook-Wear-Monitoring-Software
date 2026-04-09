@@ -3,9 +3,9 @@
 
 import os
 import sys
-import pyqtgraph as pg
 
 from qt_compat import QApplication, QIcon
+import pyqtgraph as pg
 from main_window import MainWindow
 
 

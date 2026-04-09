@@ -215,6 +215,11 @@ class SerialMixin:
             self.worker.set_tx_tap_enabled(bool(self.mon_tx_chk.isChecked()))
         except Exception:
             pass
+        try:
+            rpm = getattr(self, "_motor_target_rpm", None)
+            self.worker.set_target_rpm("0" if rpm is None else f"{float(rpm):g}")
+        except Exception:
+            pass
         self.worker.start()
 
         self.set_status("正在连接...")

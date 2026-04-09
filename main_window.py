@@ -84,6 +84,7 @@ class MainWindow(ExportMixin, LayoutMixin, MonitorMixin, PlotMixin, ChannelMixin
         self._quality_gap_triggered = False
         self._last_valid_row: Optional[Dict[str, float]] = None
         self._last_tension_setpoint: Optional[float] = None
+        self._motor_target_rpm: Optional[float] = None
         self._quality_last_source = "mu"
         self._quality_syncing = False
         self._quality_ui_syncing = False
@@ -827,8 +828,12 @@ class MainWindow(ExportMixin, LayoutMixin, MonitorMixin, PlotMixin, ChannelMixin
         tension_row.addWidget(QLabel("张力(N)"))
         self.motor_tension_edit = QLineEdit()
         self.motor_tension_edit.setPlaceholderText("例如 1")
-        self.motor_tension_btn = QPushButton("张力控制")
         tension_row.addWidget(self.motor_tension_edit, 1)
+        tension_row.addWidget(QLabel("目标转速(RPM)"))
+        self.motor_tension_rpm_edit = QLineEdit()
+        self.motor_tension_rpm_edit.setPlaceholderText("例如 100")
+        self.motor_tension_btn = QPushButton("张力控制")
+        tension_row.addWidget(self.motor_tension_rpm_edit, 1)
         tension_row.addWidget(self.motor_tension_btn)
         motor_layout.addLayout(tension_row)
 

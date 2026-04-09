@@ -80,6 +80,7 @@ class ModbusRtuWorker(QThread):
         # formatted payload and send it at a fixed interval in a separate writer thread.
         self._latest_out_payload: bytes = b""
         self._latest_lock = threading.Lock()
+        self._target_rpm: str = "0"
         self._tx_write_q: "queue.Queue[bytes]" = queue.Queue(maxsize=1)
         self._tx_writer_thread: Optional[threading.Thread] = None
         # Serialize TX/output port access and allow pausing data sending
@@ -306,6 +307,13 @@ class ModbusRtuWorker(QThread):
             self.channels = list(channels)
             self.blocks = build_blocks(self.channels, self.address_base_1)
 
+    def set_target_rpm(self, rpm_text: str):
+        t = (rpm_text or "").strip()
+        if not t:
+            t = "0"
+        with self._latest_lock:
+            self._target_rpm = t
+
     def _log(self, s: str):
         self.log_line.emit(s)
 
@@ -318,6 +326,10 @@ class ModbusRtuWorker(QThread):
             self.frame.emit(str(kind), bytes(data or b""), str(tag or ""), str(note or ""))
         except Exception:
             pass
+
+    @staticmethod
+    def _format_output_value(v: Optional[float]) -> str:
+        return 'nan' if v is None else f'{v:.6g}'
 
     def _pause_tx_output(self):
         # Pause periodic TX/output sending (reference-counted).
@@ -702,11 +714,14 @@ class ModbusRtuWorker(QThread):
                         if self.tx_enabled and self._tx_ser is not None:
                             try:
                                 parts = ['Data']
-                                for ch in channels:
-                                    if not ch.enabled:
-                                        continue
-                                    v = row.get(ch.name, None)
-                                    parts.append('nan' if v is None else (f'{v:.6g}'))
+                                enabled_names = [ch.name for ch in channels if ch.enabled]
+                                ch1_name = 'CH1' if 'CH1' in row else (enabled_names[0] if len(enabled_names) >= 1 else 'CH1')
+                                ch2_name = 'CH2' if 'CH2' in row else (enabled_names[1] if len(enabled_names) >= 2 else 'CH2')
+                                parts.append(self._format_output_value(row.get(ch1_name, None)))
+                                parts.append(self._format_output_value(row.get(ch2_name, None)))
+                                with self._latest_lock:
+                                    rpm = self._target_rpm
+                                parts.append(rpm)
                                 line = (' '.join(parts) + '\r\n').encode('ascii', errors='replace')
                                 with self._latest_lock:
                                     self._latest_out_payload = line

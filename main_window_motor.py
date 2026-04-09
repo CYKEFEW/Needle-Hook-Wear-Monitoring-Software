@@ -7,6 +7,19 @@ from qt_compat import QLabel, QMessageBox
 
 
 class MotorMixin:
+    def _set_motor_target_rpm(self, rpm_text: str):
+        try:
+            rpm_value = float(rpm_text)
+        except Exception:
+            rpm_value = None
+        self._motor_target_rpm = rpm_value
+        worker = getattr(self, "worker", None)
+        if worker is not None:
+            try:
+                worker.set_target_rpm(rpm_text)
+            except Exception:
+                pass
+
     def open_motor_control(self):
         if not hasattr(self, 'motor_dock') or self.motor_dock is None:
             return
@@ -117,14 +130,18 @@ class MotorMixin:
     def on_motor_tension(self):
         if not self._require_motor_mode(0):
             return
-        val = self._parse_number_text(self.motor_tension_edit.text(), "张力(g)")
-        if val is None:
+        tension_val = self._parse_number_text(self.motor_tension_edit.text(), "张力(N)")
+        if tension_val is None:
             return
+        rpm_val = self._parse_number_text(self.motor_tension_rpm_edit.text(), "目标转速(RPM)")
+        if rpm_val is None:
+            return
+        self._set_motor_target_rpm(rpm_val)
         try:
-            self._last_tension_setpoint = float(val)
+            self._last_tension_setpoint = float(tension_val)
         except Exception:
             pass
-        self._send_motor_cmd(f"F {val}")
+        self._send_motor_cmd(f"F {tension_val}")
 
     def on_motor_pid(self):
         kp = self._parse_number_text(self.motor_kp_edit.text(), "Kp")
@@ -143,6 +160,7 @@ class MotorMixin:
             return
         # 顺序：设置模式 -> 张力 -> 设置模式 -> 速度 -> 禁用
         # 在发送 F/Con 命令前确保模式已设置。
+        self._set_motor_target_rpm("0")
         self._send_motor_cmd("ConMode 0")
         self._send_motor_cmd("F 0")
         self._send_motor_cmd("ConMode 1")
