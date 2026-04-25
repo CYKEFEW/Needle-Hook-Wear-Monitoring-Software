@@ -861,7 +861,35 @@ class ExportMixin:
         except Exception:
             return False
 
+    def _db_ts_is_relative(self, conn) -> bool:
+        try:
+            row = conn.execute("SELECT value FROM metadata WHERE key = ?", ("ts_kind",)).fetchone()
+            if not row:
+                return False
+            return str(row[0]).strip().lower() == "relative_seconds"
+        except Exception:
+            return False
+
+    def _format_logged_db_time(self, ts_val, ts_is_relative: bool) -> str:
+        try:
+            fv = float(ts_val)
+            if not math.isfinite(fv):
+                return ""
+        except Exception:
+            return ""
+        if ts_is_relative:
+            return f"{fv:.3f}s"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fv))
+        except Exception:
+            return ""
+
     def _format_export_time(self, wall_ts, rel_ts) -> str:
+        try:
+            if rel_ts is not None and math.isfinite(float(rel_ts)):
+                return f"{float(rel_ts):.3f}s"
+        except Exception:
+            pass
         try:
             if wall_ts is not None and math.isfinite(float(wall_ts)):
                 return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(wall_ts)))
@@ -1157,6 +1185,7 @@ class ExportMixin:
             name_to_idx = {name: i for i, name in enumerate(channel_names)}
             hi_idx = name_to_idx.get(hi_name, None)
             lo_idx = name_to_idx.get(lo_name, None)
+            ts_is_relative = self._db_ts_is_relative(conn)
 
             cur = conn.execute(query)
             done_rows = 0
@@ -1167,7 +1196,7 @@ class ExportMixin:
                 for row in rows:
                     ts_val = row[0]
                     vals = list(row[1:]) if n_ch > 0 else []
-                    t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts_val)))
+                    t_str = self._format_logged_db_time(ts_val, ts_is_relative)
                     high_v = vals[hi_idx] if (hi_idx is not None and hi_idx < len(vals)) else None
                     low_v = vals[lo_idx] if (lo_idx is not None and lo_idx < len(vals)) else None
                     row_out = [t_str]
@@ -1362,6 +1391,7 @@ class ExportMixin:
             batch = []
             done_rows = 0
             base_ts = None
+            ts_is_relative = self._db_ts_is_relative(src_conn)
 
             while True:
                 rows = src_cur.fetchmany(1000)
@@ -1370,9 +1400,12 @@ class ExportMixin:
 
                 for row in rows:
                     ts_val = self._safe_float(row[0])
-                    if ts_val is not None and base_ts is None:
-                        base_ts = ts_val
-                    rel_ts = None if ts_val is None or base_ts is None else max(0.0, float(ts_val) - float(base_ts))
+                    if ts_is_relative:
+                        rel_ts = None if ts_val is None else max(0.0, float(ts_val))
+                    else:
+                        if ts_val is not None and base_ts is None:
+                            base_ts = ts_val
+                        rel_ts = None if ts_val is None or base_ts is None else max(0.0, float(ts_val) - float(base_ts))
                     vals = list(row[1:]) if n_ch > 0 else []
                     high_v = vals[hi_idx] if hi_idx is not None and hi_idx < len(vals) else None
                     low_v = vals[lo_idx] if lo_idx is not None and lo_idx < len(vals) else None

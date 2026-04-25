@@ -1059,7 +1059,7 @@ class PlotMixin:
             if getattr(self, "_log_db_path", ""):
                 row_for_log = {name: row.get(name, None) for name in self.channel_names}
                 row_for_log[self._quality_flag_name] = int(quality_flag)
-                self._data_logger.append(wall_ts, row_for_log)
+                self._data_logger.append(rel_ts, row_for_log)
         except Exception:
             pass
 

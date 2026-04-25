@@ -52,6 +52,11 @@ class DataLogger:
         conn = sqlite3.connect(self.db_path)
         try:
             self._apply_pragmas(conn)
+            conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                ("ts_kind", "relative_seconds"),
+            )
             conn.execute("CREATE TABLE IF NOT EXISTS channels (idx INTEGER PRIMARY KEY, name TEXT, unit TEXT)")
             # clear and insert channel names for this session
             conn.execute("DELETE FROM channels")
